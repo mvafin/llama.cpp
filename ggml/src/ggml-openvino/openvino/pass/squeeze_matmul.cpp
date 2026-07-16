@@ -1,3 +1,7 @@
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
 #include "squeeze_matmul.h"
 
 #include <openvino/core/graph_util.hpp>
@@ -6,18 +10,14 @@
 #include <openvino/op/matmul.hpp>
 #include <openvino/op/squeeze.hpp>
 #include <openvino/op/unsqueeze.hpp>
-#include <openvino/pass/pattern/op/label.hpp>
 #include <openvino/pass/pattern/op/pattern.hpp>
 #include <openvino/pass/pattern/op/wrap_type.hpp>
 
 namespace opp = ov::pass::pattern;
 
-namespace ov {
-namespace frontend {
 namespace ggml {
 namespace pass {
 
-// For quantized models, NPUW expects the activation to be 3d in DQ(DynamicQuantization) opt, e.g. DQMatMulGQ2i
 SqueezeMatmul::SqueezeMatmul() {
     auto m_act = opp::any_input();
     auto m_wei = opp::any_input();
@@ -48,11 +48,8 @@ SqueezeMatmul::SqueezeMatmul() {
         return false;
     };
 
-    register_matcher(std::make_shared<ov::pass::pattern::Matcher>(m_matmul, "ov::frontend::ggml::pass::SqueezeMatmul"),
-                     callback);
+    register_matcher(std::make_shared<ov::pass::pattern::Matcher>(m_matmul, "ggml::pass::SqueezeMatmul"), callback);
 }
 
 }  // namespace pass
 }  // namespace ggml
-}  // namespace frontend
-}  // namespace ov

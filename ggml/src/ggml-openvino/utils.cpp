@@ -4,8 +4,11 @@
 #include "ggml-openvino-extra.h"
 #include "ggml-openvino/ggml-decoder.h"
 #include "ggml.h"
-#include "openvino/frontend.h"
-#include "openvino/input_model.h"
+#include "openvino/frontend/gguf/frontend.hpp"
+#include "openvino/frontend/extension/decoder_transformation.hpp"
+#include "openvino/pass/llama_cpp_to_stateful.h"
+#include "openvino/pass/manager.hpp"
+#include "openvino/pass/squeeze_matmul.h"
 
 #include <algorithm>
 #include <cassert>
@@ -68,7 +71,7 @@ ov::Tensor create_ov_output_tensor(std::shared_ptr<GgmlOvDecoder> ggml_decoder,
                                    const ggml_tensor * ggml_tensor) {
     auto output_type = ggml_decoder->get_ov_type(ggml_tensor);
     ov::Shape output_shape;
-    if (ggml_decoder->is_static()) {
+    if (ggml_decoder->m_is_static) {
         output_shape = infer_request->get_output_tensor(output_index).get_shape();
     } else {
         output_shape = ggml_decoder->get_shape(ggml_tensor);
@@ -191,14 +194,23 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
             }
 
             std::shared_ptr<ov::Model> model;
-            auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph);
+            std::map<std::string, std::shared_ptr<ov::Node>> model_weights;  // weights flow as GGML_OP_NONE leaf nodes
 
             ggml_decoder = std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, model_weights, is_static, stateful);
             decoder_end_time = ggml_time_us();
 
-            auto input_model = std::make_shared<ov::frontend::ggml::InputModel>(ggml_decoder);
-            model = ov::frontend::ggml::FrontEnd::convert(input_model);
-            ggml_decoder->clear_model_weights();
+            // The frontend always emits the stateless model and lowers its SetRows ops to the
+            // stateless ScatterUpdate form by default. For stateful execution, register the
+            // stateful SetRows lowering as a transformation extension: the frontend runs it in the
+            // normalization stage (ahead of the default lowering), yielding an OpenVINO stateful
+            // model. Statefulness thus stays a backend concern with no is_stateful in the frontend.
+            ov::frontend::gguf::FrontEnd frontend;
+            if (stateful) {
+                frontend.add_extension(std::make_shared<ov::frontend::DecoderTransformationExtension>(
+                    ggml::pass::LlamaCppToStateful()));
+            }
+            model = frontend.convert(
+                frontend.load(std::static_pointer_cast<ov::frontend::gguf::GgufDecoder>(ggml_decoder)));
             conversion_end_time = ggml_time_us();
 
             if (getenv("GGML_OPENVINO_DUMP_IR")) {
@@ -383,7 +395,7 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, std::shared_ptr<o
         }
 
         std::shared_ptr<ov::Model> model;
-        auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph);
+        std::map<std::string, std::shared_ptr<ov::Node>> model_weights;  // weights flow as GGML_OP_NONE leaf nodes
 
         auto ggml_decoder_prefill = std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, model_weights,
                                                                     is_static, stateful, true, prefill_chunk_size);
@@ -391,13 +403,22 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, std::shared_ptr<o
                                                                    stateful, false, prefill_chunk_size);
         decoder_end_time = ggml_time_us();
 
-        auto input_model_prefill = std::make_shared<ov::frontend::ggml::InputModel>(ggml_decoder_prefill);
-        auto input_model_decode = std::make_shared<ov::frontend::ggml::InputModel>(ggml_decoder_decode);
+        ov::frontend::gguf::FrontEnd frontend_prefill;
+        ov::frontend::gguf::FrontEnd frontend_decode;
+        auto model_prefill = frontend_prefill.convert(
+            frontend_prefill.load(std::static_pointer_cast<ov::frontend::gguf::GgufDecoder>(ggml_decoder_prefill)));
+        auto model_decode = frontend_decode.convert(
+            frontend_decode.load(std::static_pointer_cast<ov::frontend::gguf::GgufDecoder>(ggml_decoder_decode)));
 
-        auto model_prefill = ov::frontend::ggml::FrontEnd::convert(input_model_prefill);
-        ggml_decoder_prefill->clear_model_weights();
-        auto model_decode = ov::frontend::ggml::FrontEnd::convert(input_model_decode);
-        ggml_decoder_decode->clear_model_weights();
+        // Static (NPU) path: NPUW's DQ MatMul optimization wants a 3d activation. The frontend
+        // emits the device-agnostic graph; squeezing the MatMul activation is an NPU concern, so
+        // it runs here rather than inside the frontend.
+        {
+            ov::pass::Manager manager;
+            manager.register_pass<ggml::pass::SqueezeMatmul>();
+            manager.run_passes(model_prefill);
+            manager.run_passes(model_decode);
+        }
         conversion_end_time = ggml_time_us();
 
         if (getenv("GGML_OPENVINO_DUMP_IR")) {
@@ -546,11 +567,13 @@ enum ggml_status naive_compute(ggml_cgraph * cgraph,
         return GGML_STATUS_SUCCESS;
     }
 
-    bool naive = true;
-    auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph, naive);
+    std::map<std::string, std::shared_ptr<ov::Node>> model_weights;  // weights flow as GGML_OP_NONE leaf nodes
     auto decoder = std::make_shared<GgmlOvDecoder>(cgraph, model_weights);
-    auto input_model = std::make_shared<ov::frontend::ggml::InputModel>(decoder);
-    auto model = ov::frontend::ggml::FrontEnd::convert(input_model, naive);
+    // This bare-cgraph decoder exposes no "rope_config", so the frontend builds no shared LLM
+    // scaffolding (the former naive=true path) -- see InputModel::get_rope_config.
+    ov::frontend::gguf::FrontEnd frontend;
+    auto model = frontend.convert(
+        frontend.load(std::static_pointer_cast<ov::frontend::gguf::GgufDecoder>(decoder)));
     if (getenv("GGML_OPENVINO_DUMP_IR")) {
         ov::serialize(model, "IR_naive.xml");
     }

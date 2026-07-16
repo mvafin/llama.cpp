@@ -11,7 +11,11 @@ ggml_add_backend_library(ggml-openvino
     ${GGML_HEADERS_OPENVINO}
 )
 
-target_link_libraries(ggml-openvino PRIVATE openvino::runtime TBB::tbb OpenCL::OpenCL)
+# The GGUF frontend ships as a linkable OpenVINO frontend (openvino::frontend::gguf), installed
+# alongside the runtime and exported via find_package(OpenVINO). It is hidden from
+# FrontEndManager, so it is used only through this direct linkage.
+target_link_libraries(ggml-openvino PRIVATE
+    openvino::runtime openvino::frontend::gguf TBB::tbb OpenCL::OpenCL)
 
 if (GGML_OPENVINO)
     if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")

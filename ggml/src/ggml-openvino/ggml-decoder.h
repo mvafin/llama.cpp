@@ -2,7 +2,7 @@
 
 #include "ggml-quants.h"
 #include "ggml.h"
-#include "openvino/decoder.h"
+#include "openvino/frontend/gguf/decoder.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -10,6 +10,7 @@
 #include <memory>
 #include <openvino/core/partial_shape.hpp>
 #include <optional>
+#include <set>
 #include <vector>
 
 struct ModelParams {
@@ -49,7 +50,7 @@ struct ComputeParams {
     int output_len = 1;
 };
 
-class GgmlOvDecoder : public ov::frontend::ggml::GgmlDecoder {
+class GgmlOvDecoder : public ov::frontend::gguf::GgufDecoder {
 public:
     struct NodeInfo {
         ggml_tensor * node;
@@ -75,62 +76,40 @@ public:
     // Naive graph decoder
     GgmlOvDecoder(ggml_cgraph * cgraph, std::map<std::string, std::shared_ptr<ov::Node>> & model_weights);
 
-    virtual ov::Any get_attribute(const std::string & name) const override {
-        return nullptr;
-        GGML_UNUSED(name);
-    }
-
-    virtual ov::PartialShape get_input_shape(int node_idx, const std::string & name) const override;
-
-    virtual std::vector<size_t> get_input_stride(int node_idx, const std::string & name) const override;
-
-    virtual ov::element::Type get_input_type(int node_idx, const std::string & name) const override;
+    // Per-node accessors refer to the node this decoder is bound to (m_node_idx, set by
+    // visit_subgraph). The model-scoped decoder has m_node_idx == -1 and only answers the
+    // model-level queries (get_model_inputs, get_model_output_names, ...).
+    virtual ov::Any get_attribute(const std::string & name) const override;
 
     virtual size_t get_input_size() const override;
 
-    virtual size_t get_input_size(int node_idx) const override;
+    virtual std::vector<std::string> get_input_names() const override;
 
-    virtual void get_input_node(size_t input_port_idx,
-                                std::string & producer_name,
-                                std::string & producer_output_port_name,
-                                size_t & producer_output_port_index) const override {
-        GGML_UNUSED(input_port_idx);
-        GGML_UNUSED(producer_name);
-        GGML_UNUSED(producer_output_port_name);
-        GGML_UNUSED(producer_output_port_index);
-    }
+    virtual ov::PartialShape get_output_shape() const override;
 
-    virtual std::vector<std::string> get_input_names(int node_idx) const override;
+    virtual ov::PartialShape get_input_shape(const std::string & name) const override;
 
-    virtual ov::PartialShape get_output_shape(int node_idx) const override;
+    virtual int64_t get_input_view_element_offset(const std::string & name) const override;
 
-    virtual ov::element::Type get_output_type(int node_idx) const override;
-
-    virtual int32_t * get_input_op_params(int node_idx, const std::string & name) const override;
-
-    virtual int32_t * get_output_op_params(int node_idx) const override;
-
-    virtual std::vector<std::string> get_output_names(int node_idx) const override;
+    virtual std::vector<std::string> get_output_names() const override;
 
     virtual const std::string & get_op_type() const override;
 
-    virtual const std::string & get_op_type(int node_idx) const override;
-
     virtual const std::string & get_op_name() const override;
 
-    virtual const std::string & get_op_name(int node_idx) const override;
-
-    virtual void visit_subgraph(std::function<void(std::shared_ptr<GgmlDecoder>, int node_idx)> node_visitor) const override;
+    virtual void visit_subgraph(std::function<void(std::shared_ptr<GgufDecoder>)> node_visitor) const override;
 
     ggml_tensor * get_input_ggml_tensor(const std::string & name) const { return m_inputs.at(name); }
 
-    virtual int get_op_case(int node_idx) const override { return m_node_info_list[node_idx].node_op_case; }
-
+    // Returns all model-scope input nodes (primary Parameters + auxiliary constants/parameters).
+    // Callers distinguish Parameters from auxiliary nodes via dynamic_pointer_cast.
     virtual const std::map<std::string, std::shared_ptr<ov::Node>> & get_model_inputs() const override {
-        return m_model_inputs;
+        return m_all_model_inputs;
     }
 
-    virtual const std::map<std::string, std::shared_ptr<ov::Node>> & get_model_extra_inputs() const override {
+    // Backend-internal: extra auxiliary input nodes (attention_size, n_seq_active, etc.) kept
+    // separately so the runtime can access their initial values via get_model_extra_input_values().
+    const std::map<std::string, std::shared_ptr<ov::Node>> & get_model_extra_inputs() const {
         return m_model_extra_inputs;
     }
 
@@ -138,7 +117,7 @@ public:
         return m_model_extra_input_values;
     }
 
-    virtual const std::map<std::string, std::shared_ptr<ov::Node>> & get_model_weights() const override {
+    const std::map<std::string, std::shared_ptr<ov::Node>> & get_model_weights() const {
         return m_model_weights;
     }
 
@@ -150,30 +129,23 @@ public:
 
     virtual int get_ctx_size() const { return m_model_params.ctx; }
 
-    virtual int get_ctx_swa_size() const { return m_model_params.ctx_swa; }
-
-    virtual int get_ctx_per_seq() const { return m_model_params.ctx_per_seq; }
-
-    virtual int get_ctx_per_seq_swa() const { return m_model_params.ctx_per_seq_swa; }
-
-    virtual int get_n_seq() const { return m_model_params.n_seq; }
-
-    virtual int is_swa_layer(int layer) const override {
+    // Decoder-internal helper (used by compute_op_case to classify KV-cache permutes); not part
+    // of the GgufDecoder frontend interface.
+    bool is_swa_layer(int layer) const {
         return std::find(m_model_params.swa_layers.begin(), m_model_params.swa_layers.end(), layer) !=
                m_model_params.swa_layers.end();
     }
 
-    int get_past_kv_len() const { return m_compute_params.past_kv_len; }
-
     int get_input_len() const { return m_compute_params.input_len; }
 
-    virtual int32_t * get_rope_params() const override { return const_cast<int32_t *>(m_model_params.rope_params); }
+    // Typed RoPE config, exposed to the frontend via get_attribute("rope_config") (model and
+    // node scope). RopeConfig::n_dims == 0 means no RoPE; per_op is currently always false.
+    ov::frontend::gguf::RopeConfig get_rope_config() const;
 
-    virtual std::map<std::string, std::string> get_kv_param_res_names() const override;
+    // KV-cache Parameter/Result name pairs, used by the backend's stateful runtime bookkeeping.
+    // Not part of the GgufDecoder frontend interface.
+    std::map<std::string, std::string> get_kv_param_res_names() const;
 
-    virtual bool is_static() const override { return m_is_static; }
-
-    virtual bool is_stateful() const override { return m_is_stateful; }
 
     ov::PartialShape get_graph_input_shape(const ggml_tensor * op, const ggml_tensor * input) const;
 
@@ -181,14 +153,7 @@ public:
 
     static std::shared_ptr<ov::Node> create_weight_node(ggml_tensor * tensor, bool naive = false);
 
-    static std::map<std::string, std::shared_ptr<ov::Node>> create_weight_nodes(ggml_cgraph * cgraph,
-                                                                                bool naive = false);
-
     const ggml_tensor * get_tensor_used_op(const ggml_tensor * tensor) const;
-
-    const ggml_tensor * get_tensor_from_name(const std::string & name) const;
-
-    void clear_model_weights() { m_model_weights.clear(); }
 
     static std::pair<ModelParams, ComputeParams> compute_llm_params(ggml_cgraph * cgraph, bool is_static);
 
@@ -275,12 +240,17 @@ private:
     void validate_cgraph() const;
 
     ggml_cgraph * m_cgraph = nullptr;
+    // Index of the node this decoder is bound to (set by visit_subgraph); -1 for the
+    // model-scoped decoder, which only answers model-level queries.
+    int m_node_idx = -1;
     std::map<std::string, ggml_tensor *> m_inputs;
 
     std::map<std::string, std::shared_ptr<ov::Node>> m_model_inputs;
     std::map<std::string, std::shared_ptr<ov::Node>> m_model_extra_inputs;
+    std::map<std::string, std::shared_ptr<ov::Node>> m_all_model_inputs;  // union of the above two
     std::map<std::string, std::shared_ptr<ov::Tensor>> m_model_extra_input_values;
     std::map<std::string, std::shared_ptr<ov::Node>> m_model_weights;
+    std::set<std::string> m_weight_names;  // GGML_OP_NONE leaves surfaced as weight nodes
     std::map<std::string, ggml_tensor *> m_model_outputs;
     std::vector<std::string> m_model_output_names;
     std::vector<NodeInfo> m_node_info_list;

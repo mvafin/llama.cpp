@@ -70,7 +70,10 @@ GgmlOvDecoder::GgmlOvDecoder(ggml_cgraph * cgraph,
     compute_model_inputs();
     compute_model_outputs();
 
-    for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
+    for (int node_n = 0; node_n < (int) m_node_info_list.size(); node_n++) {
+        if (m_weight_names.count(m_node_info_list[node_n].node_name)) {
+            continue;  // weight nodes already have their op type / case set
+        }
         m_node_info_list[node_n].node_op_case = compute_op_case(m_node_info_list[node_n].node);
         m_node_info_list[node_n].node_op_type = compute_op_type(m_node_info_list[node_n].node);
     }
@@ -95,13 +98,56 @@ GgmlOvDecoder::GgmlOvDecoder(ggml_cgraph * cgraph, std::map<std::string, std::sh
     set_input_output();
     compute_model_inputs();
     compute_model_outputs();
-    for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
+    m_all_model_inputs = m_model_inputs;  // no extra inputs in naive mode
+    for (int node_n = 0; node_n < (int) m_node_info_list.size(); node_n++) {
+        if (m_weight_names.count(m_node_info_list[node_n].node_name)) {
+            continue;  // weight nodes already have their op type / case set
+        }
         m_node_info_list[node_n].node_op_case = compute_op_case(m_node_info_list[node_n].node);
         m_node_info_list[node_n].node_op_type = compute_op_type(m_node_info_list[node_n].node);
     }
 }
 
 void GgmlOvDecoder::set_input_output() {
+    // First, surface each unique quantized/weight tensor as a node. A weight is a ggml leaf
+    // (GGML_OP_NONE) and keeps that genuine op type; the frontend recognizes it as a weight by
+    // the presence of the "data" attribute (get_attribute), dequantizes/requantizes from the raw
+    // bytes, and the decoder only provides them. These come first so a weight is visited before
+    // its consumer.
+    {
+        std::set<std::string> & seen_weights = m_weight_names;
+        seen_weights.clear();
+        for (int node_n = 0; node_n < m_cgraph->n_nodes; node_n++) {
+            auto * node = m_cgraph->nodes[node_n];
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                auto * src = node->src[i];
+                if (src == nullptr || src->view_src) {
+                    continue;
+                }
+                std::string src_name(src->name);
+                if (is_rope_freqs_weight(src, node)) {
+                    src_name = "rope_freqs.weight";
+                }
+                ggml_backend_buffer * buffer = src->buffer;
+                const bool is_weight =
+                    buffer && (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS || ggml_is_quantized(src->type));
+                if (!is_weight || seen_weights.count(src_name)) {
+                    continue;
+                }
+                seen_weights.insert(src_name);
+                NodeInfo wi;
+                wi.node = src;
+                wi.node_name = src_name;
+                wi.node_op_type = "GGML_OP_NONE";  // genuine ggml leaf op type
+                wi.node_output = src;
+                wi.node_output_name = src_name;
+                wi.node_op_case = 0;
+                wi.data_addr = src->data;
+                m_node_info_list.push_back(wi);
+            }
+        }
+    }
+
     for (int node_n = 0; node_n < m_cgraph->n_nodes; node_n++) {
         auto node = m_cgraph->nodes[node_n];
 
@@ -363,27 +409,18 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op, co
         // mask
         if (m_is_static) {
             input_shape = ov::PartialShape{1, 1, m_is_prefill ? m_prefill_chunk_size : 1, m_model_params.ctx};
-        } else if (m_is_stateful) {
-            input_shape = ov::PartialShape{1, 1, -1, -1};
         } else {
             input_shape = ov::PartialShape{-1, 1, -1, -1};
         }
 
     } else if (is_kvcache(input, op)) {
-        // kvcache
+        // kvcache: always the stateless layout [1, 1, seq, n_heads_kv * head_size]. Conversion to
+        // the OpenVINO stateful (ReadValue/Assign) form is done by the LlamaCppToStateful pass,
+        // which only rewires the Parameter/Result into state vars without changing the layout.
         input_shape = ov::PartialShape{get_shape(input)};
         if (!m_is_static) {
             // do not fix ctx size to make llama-bench work across test params
             input_shape[2] = -1;
-        }
-        if (is_stateful()) {
-            // Convert stateless KV cache layout [1, 1, seq, n_heads_kv * head_size]
-            // to stateful layout [1, seq, n_heads_kv, head_size].
-            assert(input_shape.size() == 4 && input_shape[0] == 1 && input_shape[1] == 1 &&
-                   input_shape[2].is_dynamic() &&
-                   input_shape[3] == (m_model_params.n_heads_kv * m_model_params.head_size));
-            input_shape = {input_shape[0], ov::Dimension::dynamic(), m_model_params.n_heads_kv,
-                           m_model_params.head_size};
         }
 
     } else if (is_kv_idx(input, op)) {
@@ -430,6 +467,10 @@ void GgmlOvDecoder::add_extra_inputs() {
     create_1d_input("seq_active_end", m_compute_params.seq_active_start + m_compute_params.n_seq_active);
     create_1d_input("token_len_per_seq", m_compute_params.token_len_per_seq);
     // create_1d_input("token_len", m_token_len_per_seq * m_n_seq_active);
+
+    // Build the unified map returned by get_model_inputs() (primary + extra).
+    m_all_model_inputs = m_model_inputs;
+    m_all_model_inputs.insert(m_model_extra_inputs.begin(), m_model_extra_inputs.end());
 }
 
 bool GgmlOvDecoder::node_is_used_as_src(const int node_idx) {
@@ -453,7 +494,10 @@ void GgmlOvDecoder::compute_model_inputs() {
         // the node op is NONE means this node maybe as input of later nodes, we should add it to model inputs for this node.
         if (node->op == GGML_OP_NONE && node_is_used_as_src(i)) {
             std::string node_name(node->name);
-            if (m_model_weights.find(node_name) == m_model_weights.end()) {
+            // Weights are surfaced as their own GGML_OP_NONE nodes (tracked in m_weight_names),
+            // not model inputs, even though m_model_weights is empty in the node-based weight path.
+            if (m_model_weights.find(node_name) == m_model_weights.end() &&
+                m_weight_names.find(node_name) == m_weight_names.end()) {
                 m_inputs[node_name] = node;
                 auto param_node =
                     std::make_shared<ov::op::v0::Parameter>(get_ov_type(node), get_graph_input_shape(node, nullptr));
@@ -472,7 +516,8 @@ void GgmlOvDecoder::compute_model_inputs() {
             if (src->flags & GGML_TENSOR_FLAG_INPUT) {
                 src_name = get_graph_input_ov_name(src, node);
             }
-            if (m_model_weights.find(src_name) != m_model_weights.end()) {
+            if (m_model_weights.find(src_name) != m_model_weights.end() ||
+                m_weight_names.find(src_name) != m_weight_names.end()) {
                 continue;
             }
 
@@ -561,59 +606,12 @@ const ggml_tensor * GgmlOvDecoder::get_tensor_used_op(const ggml_tensor * tensor
     return nullptr;
 }
 
-const ggml_tensor * GgmlOvDecoder::get_tensor_from_name(const std::string & name) const {
-    for (int i = 0; i < m_cgraph->n_nodes; i++) {
-        const auto * node = m_cgraph->nodes[i];
-        for (int j = 0; j < GGML_MAX_SRC; j++) {
-            const auto * src = node->src[j];
-            if (src == nullptr) {
-                break;
-            }
-            if (std::string(src->name) == name) {
-                return src;
-            }
-        }
-    }
-    return nullptr;
-}
-
 std::map<std::string, std::string> GgmlOvDecoder::get_kv_param_res_names() const {
     std::map<std::string, std::string> kv_param_res_names;
     for (const auto & name : m_model_params.kv_names) {
         kv_param_res_names[name] = name;
     }
     return kv_param_res_names;
-}
-
-std::map<std::string, std::shared_ptr<ov::Node>> GgmlOvDecoder::create_weight_nodes(ggml_cgraph * cgraph, bool naive) {
-    std::map<std::string, std::shared_ptr<ov::Node>> model_weights;
-    auto * nodes = cgraph->nodes;
-    auto n_nodes = cgraph->n_nodes;
-    for (int node_i = 0; node_i < n_nodes; node_i++) {
-        auto * node = nodes[node_i];
-        for (int i = 0; i < GGML_MAX_SRC; i++) {
-            auto * src = node->src[i];
-            if (src == nullptr) {
-                continue;
-            }
-
-            std::string src_name(src->name);
-            if (is_rope_freqs_weight(src, node)) {
-                src_name = "rope_freqs.weight";
-            }
-            if (!src->view_src) {
-                ggml_backend_buffer * buffer = src->buffer;
-                if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS || ggml_is_quantized(src->type)) {
-                    if (model_weights.find(src_name) == model_weights.end()) {
-                        auto weight_node = create_weight_node(src, naive);
-                        weight_node->set_friendly_name(src_name);
-                        model_weights[src_name] = weight_node;
-                    }
-                }
-            }
-        }
-    }
-    return model_weights;
 }
 
 std::shared_ptr<ov::Node> GgmlOvDecoder::create_weight_node(ggml_tensor * tensor, bool naive) {
@@ -852,66 +850,150 @@ ov::element::Type GgmlOvDecoder::get_ov_type(const ggml_tensor * tensor) {
     }
 }
 
-ov::PartialShape GgmlOvDecoder::get_input_shape(int node_idx, const std::string & name) const {
-    return ov::PartialShape(get_shape(m_node_info_list[node_idx].node_inputs.at(name)));
-}
-
-std::vector<size_t> GgmlOvDecoder::get_input_stride(int node_idx, const std::string & name) const {
-    return get_stride(m_node_info_list[node_idx].node_inputs.at(name));
-}
-
-ov::element::Type GgmlOvDecoder::get_input_type(int node_idx, const std::string & name) const {
-    return get_ov_type(m_node_info_list[node_idx].node_inputs.at(name));
-}
-
 size_t GgmlOvDecoder::get_input_size() const {
-    return m_model_inputs.size();
+    // Model scope: number of model inputs. Node scope: number of this node's inputs.
+    return m_node_idx == -1 ? m_model_inputs.size() : m_node_info_list[m_node_idx].node_inputs_names.size();
 }
 
-size_t GgmlOvDecoder::get_input_size(int node_idx) const {
-    return m_node_info_list[node_idx].node_inputs_names.size();
+std::vector<std::string> GgmlOvDecoder::get_input_names() const {
+    return m_node_info_list[m_node_idx].node_inputs_names;
 }
 
-std::vector<std::string> GgmlOvDecoder::get_input_names(int node_idx) const {
-    return m_node_info_list[node_idx].node_inputs_names;
-}
-
-ov::PartialShape GgmlOvDecoder::get_output_shape(int node_idx) const {
-    auto * ggml_tensor = m_node_info_list[node_idx].node_output;
+ov::PartialShape GgmlOvDecoder::get_output_shape() const {
+    auto * ggml_tensor = m_node_info_list[m_node_idx].node_output;
+    // A weight node's output shape is the logical 2D [rows, cols] the frontend expects.
+    if (m_weight_names.count(m_node_info_list[m_node_idx].node_name)) {
+        return ov::PartialShape({static_cast<int64_t>(ggml_tensor->ne[1]), static_cast<int64_t>(ggml_tensor->ne[0])});
+    }
     return ov::PartialShape(get_shape(ggml_tensor));
 }
 
-ov::element::Type GgmlOvDecoder::get_output_type(const int node_idx) const {
-    return get_ov_type(m_node_info_list[node_idx].node);
+ov::PartialShape GgmlOvDecoder::get_input_shape(const std::string & name) const {
+    return ov::PartialShape(get_shape(m_node_info_list[m_node_idx].node_inputs.at(name)));
 }
 
-std::vector<std::string> GgmlOvDecoder::get_output_names(int node_idx) const {
-    return {m_node_info_list[node_idx].node_output_name};
+std::vector<std::string> GgmlOvDecoder::get_output_names() const {
+    return {m_node_info_list[m_node_idx].node_output_name};
 }
 
 const std::string & GgmlOvDecoder::get_op_name() const {
     static const std::string unknown_name = "UNKNOWN_OP_NAME";
-    return unknown_name;
+    return m_node_idx == -1 ? unknown_name : m_node_info_list[m_node_idx].node_name;
 }
 
-const std::string & GgmlOvDecoder::get_op_name(int node_idx) const {
-    return m_node_info_list[node_idx].node_name;
+ov::frontend::gguf::RopeConfig GgmlOvDecoder::get_rope_config() const {
+    // rope_params layout (see ggml_compute_forward_rope / set in compute_llm_params):
+    //   [1]=n_dims, [4]=n_ctx_orig, [5]=freq_base, [6]=freq_scale, [7]=ext_factor,
+    //   [8]=attn_factor, [9]=beta_fast, [10]=beta_slow (floats bit-stored in the int32 array).
+    // rope_params holds floats bit-stored in the int32 array; read them back as floats. The array
+    // is int32-aligned, so a reinterpret load is well-defined (same as ggml's own op-param reads).
+    const int32_t * rp = m_model_params.rope_params;
+    const float * fp = reinterpret_cast<const float *>(rp);
+    ov::frontend::gguf::RopeConfig cfg;
+    cfg.n_dims = rp[1];
+    cfg.n_ctx_orig = rp[4];
+    cfg.freq_base = fp[5];
+    cfg.freq_scale = fp[6];
+    cfg.ext_factor = fp[7];
+    cfg.attn_factor = fp[8];
+    cfg.beta_fast = fp[9];
+    cfg.beta_slow = fp[10];
+    return cfg;
 }
 
-int32_t * GgmlOvDecoder::get_input_op_params(int node_idx, const std::string & name) const {
-    return m_node_info_list[node_idx].node_inputs.at(name)->op_params;
+int64_t GgmlOvDecoder::get_input_view_element_offset(const std::string & name) const {
+    // A VIEW's start offset is stored in op_params[0..1] as a byte count.
+    // Divide by nb[0] (bytes per element) to return an element count.
+    const ggml_tensor * src = m_node_info_list[m_node_idx].node_inputs.at(name);
+    size_t byte_offset = 0;
+    memcpy(&byte_offset, src->op_params, sizeof(size_t));
+    return static_cast<int64_t>(byte_offset / src->nb[0]);
 }
 
-int32_t * GgmlOvDecoder::get_output_op_params(int node_idx) const {
-    return m_node_info_list[node_idx].node->op_params;
-}
+ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
+    // Model-level attributes (available on both the model-scoped decoder and any node decoder).
+    if (name == "rope_config") {
+        return get_rope_config();
+    }
+    if (m_node_idx == -1) {
+        return {};  // model-scoped decoder has no node-specific attributes
+    }
+    const auto & info = m_node_info_list[m_node_idx];
 
-void GgmlOvDecoder::visit_subgraph(std::function<void(std::shared_ptr<GgmlDecoder>, int node_idx)> node_visitor) const {
-    for (int node_idx = 0; node_idx < m_cgraph->n_nodes; node_idx++) {
-        if (m_cgraph->nodes[node_idx]->op == GGML_OP_NONE) {
-            continue;
+    // Weight nodes: expose raw bytes ("data") + ggml quant type name ("quant_type"). The "data"
+    // attribute is what marks a GGML_OP_NONE leaf as a weight for the frontend; the frontend
+    // dequantizes / requantizes from it, so the decoder never builds OV weight nodes.
+    if (m_weight_names.count(info.node_name)) {
+        const ggml_tensor * t = info.node_output;
+        if (name == "data") {
+            return ov::Tensor(ov::element::u8, ov::Shape{ggml_nbytes(t)}, t->data);
         }
-        node_visitor(std::make_shared<GgmlOvDecoder>(*this), node_idx);
+        if (name == "quant_type") {
+            return std::string(ggml_type_name(t->type));
+        }
+        return {};
+    }
+
+    // Scalar op parameters, read from the node's op_params via ggml's own accessors (same
+    // int32/float layout the translators previously read by hand).
+    if (name == "eps") {
+        return ggml_get_op_params_f32(info.node, 0);
+    }
+    if (name == "scale") {
+        return ggml_get_op_params_f32(info.node, 0);
+    }
+    if (name == "bias") {
+        return ggml_get_op_params_f32(info.node, 1);
+    }
+    if (name == "max_bias") {
+        return ggml_get_op_params_f32(info.node, 1);
+    }
+    if (name == "logit_softcap") {
+        return ggml_get_op_params_f32(info.node, 2);
+    }
+    if (name == "swapped") {
+        return ggml_get_op_params_i32(info.node, 1) != 0;
+    }
+    if (name == "op_case") {
+        return info.node_op_case;
+    }
+    if (name == "output_type") {
+        return get_ov_type(info.node);
+    }
+    if (name == "input_ggml_shape") {
+        // ggml shape of input 0, needed by the VIEW op_case 3 translator to restore the
+        // original layout before slicing (the OV node may have been reshaped already).
+        return get_shape(info.node_inputs_names.empty() ? info.node
+                                                        : info.node_inputs.at(info.node_inputs_names[0]));
+    }
+    if (name == "is_swa") {
+        // FLASH_ATTN_EXT: mask input (src[3]) name contains "swa" for SWA layers.
+        if (info.node->op == GGML_OP_FLASH_ATTN_EXT && info.node->src[3] != nullptr) {
+            return std::string(info.node->src[3]->name).find("swa") != std::string::npos;
+        }
+        return false;
+    }
+    if (name == "view_seq_offset") {
+        // PERMUTE KV-cache case: byte offset of the VIEW input divided by nb[3] (bytes per
+        // sequence) gives the first active sequence index.
+        if (info.node->op == GGML_OP_PERMUTE && info.node->src[0] != nullptr &&
+            info.node->src[0]->op == GGML_OP_VIEW) {
+            const ggml_tensor * view = info.node->src[0];
+            size_t byte_offset = 0;
+            memcpy(&byte_offset, view->op_params, sizeof(size_t));
+            return static_cast<int64_t>(byte_offset / view->src[0]->nb[3]);
+        }
+        return static_cast<int64_t>(0);
+    }
+    return {};
+}
+
+void GgmlOvDecoder::visit_subgraph(std::function<void(std::shared_ptr<GgufDecoder>)> node_visitor) const {
+    for (int node_idx = 0; node_idx < (int) m_node_info_list.size(); node_idx++) {
+        // Hand the visitor a decoder bound to this node (per-node accessors use m_node_idx).
+        auto node_decoder = std::make_shared<GgmlOvDecoder>(*this);
+        node_decoder->m_node_idx = node_idx;
+        node_visitor(node_decoder);
     }
 }
 
@@ -975,11 +1057,7 @@ std::string GgmlOvDecoder::compute_op_type(const ggml_tensor * node) {
     return unknown_op;
 }
 
-const std::string & GgmlOvDecoder::get_op_type(int node_idx) const {
-    return m_node_info_list[node_idx].node_op_type;
-}
-
 const std::string & GgmlOvDecoder::get_op_type() const {
     static const std::string unknown_op = "UNKNOWN_GGML_OP";
-    return unknown_op;
+    return m_node_idx == -1 ? unknown_op : m_node_info_list[m_node_idx].node_op_type;
 }

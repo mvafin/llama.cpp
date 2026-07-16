@@ -239,45 +239,11 @@ static void ggml_backend_openvino_buffer_set_tensor(ggml_backend_buffer_t buffer
     bool is_2d = (tensor->ne[2] == 1 && tensor->ne[3] == 1);
 
     if (is_weight_buffer && is_full_tensor_set && is_2d) {
-        try {
-            auto result = process_weight_tensor(tensor, data, tensor->data);
-            result.weight_node->set_friendly_name(tensor->name);
-
-            // const auto & layout = result.layout;
-            ggml_openvino_extra_base * extra;
-
-            // Quantized path with extracted weight/scale/zp tensors
-            if (result.is_quantized()) {
-                extra = new ggml_openvino_quantized_weight_extra(std::move(result.weights), std::move(result.scales),
-                                                                 std::move(result.zp), result.weight_node);
-
-                // if (layout.is_requant) {
-                //     GGML_LOG_DEBUG("%s: requantized %s to %s (u%d, block_size=%ld)\n", __func__, tensor->name,
-                //                    extra_quant_type_name(layout.requant_type.value()), layout.is_u4 ? 4 : 8,
-                //                    layout.weights_per_block);
-                // } else {
-                //     int64_t n_blocks = ggml_nelements(tensor) / layout.weights_per_block;
-                //     GGML_LOG_DEBUG("%s: extracted quantized weight node for %s (u%d, %zu weights, %ld blocks)\n",
-                //                    __func__, tensor->name, layout.is_u4 ? 4 : 8, layout.weights_size, n_blocks);
-                // }
-            } else {
-                // F16/F32/BF16 weight or F16-requant
-                extra = new ggml_openvino_weight_extra(std::move(result.weights), result.weight_node);
-
-                // if (layout.total_size > 0) {
-                //     GGML_LOG_DEBUG("%s: requantized %s to F16\n", __func__, tensor->name);
-                // } else {
-                //     GGML_LOG_DEBUG("%s: created shared-memory weight node for %s\n", __func__, tensor->name);
-                // }
-            }
-
-            ctx->tensor_extras[tensor] = extra;
-            tensor->extra = extra;
-
-        } catch (const std::exception & e) {
-            GGML_LOG_ERROR("%s: failed to process weight tensor for %s: %s\n", __func__, tensor->name, e.what());
-            memcpy((char *) tensor->data + offset, data, size);
-        }
+        // Weights-as-nodes: keep the original GGUF block bytes in tensor->data. The OpenVINO
+        // gguf frontend extracts / dequantizes / requantizes from these raw bytes (the
+        // decoder surfaces them as GGML_OP_NONE leaf nodes), so the backend must NOT pre-extract
+        // and overwrite tensor->data here (that was the old get_model_weights() path).
+        memcpy((char *) tensor->data + offset, data, size);
     } else {
         // Non-weight tensor (KV cache, activations, etc.) - copy data. test-backend-ops also goes here
         if (ctx->is_remote) {

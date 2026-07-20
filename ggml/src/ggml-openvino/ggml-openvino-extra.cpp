@@ -4,6 +4,7 @@
 #include "ggml.h"
 
 #include <cstring>
+#include <string>
 #include <openvino/runtime/intel_gpu/ocl/ocl.hpp>
 #include <openvino/runtime/intel_npu/level_zero/level_zero.hpp>
 #include <openvino/runtime/properties.hpp>
@@ -53,41 +54,36 @@ void ggml_openvino_device_config::init() {
     }
 
     // Initialize remote context with queue sharing for GPU
-    if (device_name == "GPU") {
-        // Create OpenCL context and queue
+    if (device_name == "GPU" || device_name.rfind("GPU.", 0) == 0) {
+        // Use OV's default context for this device to get the underlying cl_context.
+        // This avoids any OpenCL-vs-OpenVINO device index mismatch.
+        cl_context cl_ctx = nullptr;
+        cl_device_id cl_device = nullptr;
+        try {
+            auto ov_ctx = ov_singleton_core().get_default_context(device_name)
+                              .as<ov::intel_gpu::ocl::ClContext>();
+            cl_ctx = ov_ctx.get();
+            // Retrieve the device from the cl_context
+            clGetContextInfo(cl_ctx, CL_CONTEXT_DEVICES, sizeof(cl_device_id), &cl_device, nullptr);
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("Failed to get OpenCL context from OV: %s\n", e.what());
+            return;
+        }
+        if (!cl_device) {
+            GGML_LOG_ERROR("Failed to get OpenCL device from OV context\n");
+            return;
+        }
+
         cl_int err;
-        cl_platform_id platform;
-        err = clGetPlatformIDs(1, &platform, nullptr);
-        if (err != CL_SUCCESS) {
-            GGML_LOG_ERROR("Failed to get OpenCL platform: %d\n", err);
-            return;
-        }
-
-        cl_device_id cl_device;
-        err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &cl_device, nullptr);
-        if (err != CL_SUCCESS) {
-            GGML_LOG_ERROR("Failed to get OpenCL device: %d\n", err);
-            return;
-        }
-
-        cl_context cl_ctx = clCreateContext(nullptr, 1, &cl_device, nullptr, nullptr, &err);
-        if (err != CL_SUCCESS) {
-            GGML_LOG_ERROR("Failed to create OpenCL context: %d\n", err);
-            return;
-        }
 
         cl_queue = clCreateCommandQueueWithProperties(cl_ctx, cl_device, nullptr, &err);
         if (err != CL_SUCCESS) {
             GGML_LOG_ERROR("Failed to create OpenCL command queue: %d\n", err);
-            clReleaseContext(cl_ctx);
             return;
         }
 
         // Create OpenVINO remote context with queue sharing
         remote_context = ov::intel_gpu::ocl::ClContext(ov_singleton_core(), cl_queue);
-
-        // Release the context (queue keeps a reference)
-        clReleaseContext(cl_ctx);
     } else if (device_name == "NPU") {
         // remote tensor is not used for NPU yet
         // remote_context = ov_singleton_core().get_default_context(device_name);
@@ -122,6 +118,12 @@ const std::string & ggml_openvino_get_device_name() {
 // Check if running on NPU
 bool ggml_openvino_is_npu() {
     return ggml_openvino_get_device_config().is_npu;
+}
+
+// Check if running on any GPU (GPU, GPU.0, GPU.1, ...)
+bool ggml_openvino_is_gpu() {
+    const auto & name = ggml_openvino_get_device_name();
+    return name == "GPU" || name.rfind("GPU.", 0) == 0;
 }
 
 // Get the remote context for the current device (returns empty optional for CPU)
@@ -368,7 +370,7 @@ ggml_openvino_tensor_extra * ggml_openvino_create_tensor_extra(const ggml_tensor
 
     std::shared_ptr<ov::Tensor> ov_tensor;
     if (is_remote) {
-        GGML_ASSERT(device_name == "GPU");
+        GGML_ASSERT(device_name == "GPU" || device_name.rfind("GPU.", 0) == 0);
         auto gpu_context = remote_context->as<ov::intel_gpu::ocl::ClContext>();
         auto usm_tensor = gpu_context.create_tensor(element_type, shape, tensor->data);
         ov_tensor = std::make_shared<ov::intel_gpu::ocl::USMTensor>(std::move(usm_tensor));

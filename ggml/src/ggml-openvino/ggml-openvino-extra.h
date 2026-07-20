@@ -82,6 +82,9 @@ const std::string & ggml_openvino_get_device_name();
 // Check if running on NPU
 bool ggml_openvino_is_npu();
 
+// Check if running on any GPU (GPU, GPU.0, GPU.1, ...)
+bool ggml_openvino_is_gpu();
+
 // Get requantization type for a tensor type (returns nullopt if no requant needed)
 std::optional<ExtraQuantType> ggml_openvino_get_requant_type(const ggml_tensor * tensor, bool no_requant = false);
 

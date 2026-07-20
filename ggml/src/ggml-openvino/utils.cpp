@@ -9,10 +9,16 @@
 #include "openvino/pass/llama_cpp_to_stateful.h"
 #include "openvino/pass/manager.hpp"
 #include "openvino/pass/squeeze_matmul.h"
+#include <openvino/op/parameter.hpp>
+#include <openvino/op/reshape.hpp>
+#include <openvino/op/slice.hpp>
+#include <openvino/op/transpose.hpp>
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <optional>
+#include <openvino/runtime/intel_gpu/ocl/ocl.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -65,10 +71,172 @@ enum ggml_status ov_graph_compute(ggml_cgraph * cgraph, ggml_backend_t backend) 
     }
 }
 
+// Remove KV-cache trim Slice ops that the GGUF frontend inserts after conversion.
+// The frontend faithfully emits Slice(cache_k_l*, 0, attention_size, 1, dim=2)
+// per attention layer to trim the full ctx_per_seq allocation down to n_kv.  At
+// inference time the backend supplies correctly-sized KV tensors via
+// try_make_kv_sliced_tensor, making these Slices redundant.  Keeping them means
+// the GPU plugin dispatches a strided_slice_ref kernel per layer per step and OV
+// re-propagates shapes through them on every infer() call.
+//
+// Applied once after frontend.convert() and before compile_model().
+// `single_seq` = true when n_seq==1 and seq_active_start==0 (standard single-
+// sequence decode); the axis-0 "active-sequence" Slices are then identity ops.
+static void remove_kv_trim_slices(std::shared_ptr<ov::Model> & model, bool single_seq) {
+    // Trace through Reshape/Transpose to find a KV-cache source — either
+    // a Parameter named "cache_*" (input side) or a SetRows/compute node
+    // whose friendly name contains "cache_k" or "cache_v" (output side).
+    auto is_kv_source = [](ov::Output<ov::Node> out) -> bool {
+        for (int depth = 0; depth < 5; ++depth) {
+            auto node = out.get_node_shared_ptr();
+            if (auto p = ov::as_type_ptr<ov::op::v0::Parameter>(node)) {
+                return p->get_friendly_name().rfind("cache_", 0) == 0;
+            }
+            const auto & nm = node->get_friendly_name();
+            if (nm.find("cache_k") != std::string::npos ||
+                nm.find("cache_v") != std::string::npos) {
+                return true;
+            }
+            if (ov::is_type<ov::op::v1::Reshape>(node) ||
+                ov::is_type<ov::op::v1::Transpose>(node)) {
+                out = node->input_value(0);
+            } else {
+                break;
+            }
+        }
+        return false;
+    };
+
+    // For the axis-0 single-sequence identity Slice, check whether the start/end
+    // inputs are the seq_active_start / seq_active_end extra Parameters.
+    auto is_seq_active_param = [](ov::Output<ov::Node> out, const char * name_prefix) -> bool {
+        auto p = ov::as_type_ptr<ov::op::v0::Parameter>(out.get_node_shared_ptr());
+        return p && p->get_friendly_name().rfind(name_prefix, 0) == 0;
+    };
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto & node : model->get_ordered_ops()) {
+            auto slice = ov::as_type_ptr<ov::op::v8::Slice>(node);
+            if (!slice || slice->get_input_size() != 5) {
+                continue;
+            }
+            auto axes_const = ov::as_type_ptr<ov::op::v0::Constant>(slice->input_value(4).get_node_shared_ptr());
+            if (!axes_const) continue;
+            auto axes = axes_const->cast_vector<int64_t>();
+            if (axes.size() != 1) continue;
+
+            if (axes[0] == 2 || axes[0] == -2) {
+                // --- axis-2 KV seq-length trim (from start=0 constant) ---
+                auto start_const = ov::as_type_ptr<ov::op::v0::Constant>(slice->input_value(1).get_node_shared_ptr());
+                if (!start_const) continue;
+                auto starts = start_const->cast_vector<int64_t>();
+                if (starts.size() != 1 || starts[0] != 0) continue;
+                if (!is_kv_source(slice->input_value(0))) continue;
+
+            } else if ((axes[0] == 0 || axes[0] == -4) && single_seq) {
+                // --- axis-0 active-sequence Slice: identity for n_seq==1 ---
+                // start = seq_active_start (always 0), end = seq_active_end (always 1)
+                // → Slice(input[1-batch], start=0, end=1) = identity; safe to remove.
+                auto step_const = ov::as_type_ptr<ov::op::v0::Constant>(slice->input_value(3).get_node_shared_ptr());
+                if (!step_const) continue;
+                auto steps = step_const->cast_vector<int64_t>();
+                if (steps.size() != 1 || steps[0] != 1) continue;
+                if (!is_seq_active_param(slice->input_value(1), "seq_active_start")) continue;
+                if (!is_seq_active_param(slice->input_value(2), "seq_active_end"))   continue;
+                if (!is_kv_source(slice->input_value(0))) continue;
+
+            } else {
+                continue;
+            }
+
+            ov::replace_node(slice, {slice->input_value(0)});
+            changed = true;
+            break;
+        }
+    }
+}
+
+// (n_kv == attention_size rows) instead of the full ctx_per_seq allocation.
+// This makes the Slice nodes inside the compiled model receive an already-
+// correctly-sized input so the GPU Slice kernel becomes a cheap pass-through,
+// reducing strided_slice_ref dispatch count and OV shape-propagation overhead.
+//
+// `for_input` controls whether remote (USM) tensors are allowed:
+//   true  → input path: creating a smaller USM sub-view is safe (read-only KV).
+//   false → output path: remote sub-view skipped due to in-place ScatterUpdate
+//           GPU bug (CVS-186519) that can corrupt KV writes on some driver versions.
+static std::optional<ov::Tensor> try_make_kv_sliced_tensor(
+        std::shared_ptr<GgmlOvDecoder> ggml_decoder,
+        const std::string & name,
+        const ggml_tensor * ggml_tensor,
+        bool for_input = false) {
+    if (getenv("GGML_OPENVINO_DISABLE_KV_SLICE")) {
+        return std::nullopt;
+    }
+    if (ggml_decoder->m_is_static || ggml_decoder->m_is_stateful) {
+        return std::nullopt;
+    }
+    // Remote (USM) output tensors: skip due to in-place ScatterUpdate GPU bug.
+    // Input path is safe because reading a sub-view doesn't involve write-back.
+    const bool is_remote = (ggml_tensor->extra != nullptr);
+    if (is_remote && !for_input) {
+        return std::nullopt;
+    }
+    if (ggml_tensor->op != GGML_OP_NONE || ggml_tensor->view_src != nullptr) {
+        return std::nullopt;
+    }
+    const auto * op = ggml_decoder->get_tensor_used_op(ggml_tensor);
+    if (!op || !GgmlOvDecoder::is_kvcache(ggml_tensor, op)) {
+        return std::nullopt;
+    }
+    const auto & compute_params = ggml_decoder->get_compute_params();
+    if (compute_params.n_seq_active != 1 || compute_params.seq_active_start != 0) {
+        return std::nullopt;
+    }
+    // Only cache_k_lN / cache_v_lN tensors have the "_l" layer-index marker.
+    if (name.find("_l") == std::string::npos) {
+        return std::nullopt;
+    }
+    const int layer = extract_layer_from_name(name);
+    if (ggml_decoder->is_swa_layer(layer)) {
+        return std::nullopt;  // SWA ring-buffer: first n_kv rows are not contiguous prefix
+    }
+    const int ctx_per_seq = ggml_decoder->get_ctx_per_seq();
+    const int n_kv        = compute_params.attention_size;
+    if (ctx_per_seq <= 0 || n_kv <= 0 || n_kv >= ctx_per_seq) {
+        return std::nullopt;
+    }
+    ov::Shape full_shape = GgmlOvDecoder::get_shape(ggml_tensor);
+    // Expected KV layout: [1, 1, ctx_per_seq, n_heads_kv * head_size]
+    if (full_shape.size() != 4 || full_shape[0] != 1 || full_shape[1] != 1 ||
+        static_cast<int>(full_shape[2]) != ctx_per_seq) {
+        return std::nullopt;
+    }
+    ov::Shape sliced_shape = full_shape;
+    sliced_shape[2] = static_cast<size_t>(n_kv);
+
+    if (is_remote) {
+        // Create a proper GPU (USM) sub-tensor via the remote context.
+        auto remote_context = ggml_openvino_get_remote_context();
+        if (!remote_context.has_value()) {
+            return std::nullopt;
+        }
+        auto gpu_context = remote_context->as<ov::intel_gpu::ocl::ClContext>();
+        return gpu_context.create_tensor(
+            GgmlOvDecoder::get_ov_type(ggml_tensor), sliced_shape, ggml_tensor->data);
+    }
+    return ov::Tensor(GgmlOvDecoder::get_ov_type(ggml_tensor), sliced_shape, ggml_tensor->data);
+}
+
 ov::Tensor create_ov_output_tensor(std::shared_ptr<GgmlOvDecoder> ggml_decoder,
                                    std::shared_ptr<ov::InferRequest> infer_request,
                                    int output_index,
                                    const ggml_tensor * ggml_tensor) {
+    if (auto sliced = try_make_kv_sliced_tensor(ggml_decoder, std::string(ggml_tensor->name), ggml_tensor)) {
+        return *sliced;
+    }
     auto output_type = ggml_decoder->get_ov_type(ggml_tensor);
     ov::Shape output_shape;
     if (ggml_decoder->m_is_static) {
@@ -213,6 +381,13 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
                 frontend.load(std::static_pointer_cast<ov::frontend::gguf::GgufDecoder>(ggml_decoder)));
             conversion_end_time = ggml_time_us();
 
+            // Remove KV-cache trim Slices added by the frontend: the backend supplies
+            // correctly-sized KV tensors at runtime via try_make_kv_sliced_tensor.
+            // Pass single_seq=true when n_seq==1 and seq_active_start==0 so the
+            // axis-0 active-sequence identity Slices are also removed.
+            const bool single_seq = (c_params.n_seq_active == 1 && c_params.seq_active_start == 0);
+            remove_kv_trim_slices(model, single_seq);
+
             if (getenv("GGML_OPENVINO_DUMP_IR")) {
                 char timestamped_filename[64];
                 auto timestamp = (long long) ggml_time_us();
@@ -229,6 +404,19 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
             }
             compile_end_time = ggml_time_us();
             infer_request = std::make_shared<ov::InferRequest>(compiled_model.create_infer_request());
+
+            if (getenv("GGML_OPENVINO_DUMP_EXEC_GRAPH")) {
+                static std::atomic<int> dump_count{0};
+                if (dump_count.fetch_add(1) == 0) {  // dump only once (first graph = main LLM decode graph)
+                    try {
+                        auto exec_graph = compiled_model.get_runtime_model();
+                        ov::serialize(exec_graph, "exec_graph.xml");
+                        GGML_LOG_WARN("OpenVINO: execution graph written to exec_graph.xml\n");
+                    } catch (const std::exception & e) {
+                        GGML_LOG_ERROR("OpenVINO: failed to dump exec graph: %s\n", e.what());
+                    }
+                }
+            }
             entry->ptr = ggml_decoder;
 
             std::vector<std::string> ov_input_names;
@@ -615,6 +803,12 @@ enum ggml_status naive_compute(ggml_cgraph * cgraph,
 namespace {
 ov::Tensor convert_ggml_input_to_ov(std::shared_ptr<GgmlOvDecoder> ggml_decoder, const std::string & name) {
     const auto * ggml_tensor = ggml_decoder->get_input_ggml_tensor(name);
+
+    // Pre-slice KV-cache inputs to n_kv rows (avoid GPU Slice dispatch per step).
+    // for_input=true: USM sub-views are safe here (read-only KV access).
+    if (auto sliced = try_make_kv_sliced_tensor(ggml_decoder, name, ggml_tensor, /*for_input=*/true)) {
+        return *sliced;
+    }
 
     if (ggml_tensor->extra != nullptr) {
         // GGML_LOG_DEBUG("Using ggml_tensor->extra as ov::Tensor for input: %s\n", name.c_str());

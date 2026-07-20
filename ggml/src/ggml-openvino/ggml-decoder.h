@@ -129,6 +129,11 @@ public:
 
     virtual int get_ctx_size() const { return m_model_params.ctx; }
 
+    // Returns the per-sequence KV cache context size (allocated rows in the KV cache).
+    // Used by try_make_kv_sliced_tensor to determine when a smaller tensor view can
+    // be passed to the model, avoiding GPU-side Slice kernel dispatches.
+    int get_ctx_per_seq() const { return m_model_params.ctx_per_seq; }
+
     // Decoder-internal helper (used by compute_op_case to classify KV-cache permutes); not part
     // of the GgufDecoder frontend interface.
     bool is_swa_layer(int layer) const {

@@ -5,11 +5,17 @@ inputs:
     description: "Installation path"
     required: true
   version_major:
-    description: "OpenVINO major version (e.g., 2026.2)"
-    required: true
+    description: "OpenVINO major version (e.g., 2026.2); used only when channel=release"
+    required: false
+    default: ""
   version_full:
-    description: "OpenVINO full version"
-    required: true
+    description: "OpenVINO full version; used only when channel=release"
+    required: false
+    default: ""
+  channel:
+    description: "Package channel: 'nightly' (latest master build, ships the GGUF frontend) or 'release'"
+    required: false
+    default: "nightly"
 
 runs:
   using: "composite"
@@ -17,7 +23,18 @@ runs:
     - name: Download and extract OpenVINO Runtime
       shell: powershell
       run: |
-        $url = "https://storage.openvinotoolkit.org/repositories/openvino/packages/${{ inputs.version_major }}/windows/openvino_toolkit_windows_${{ inputs.version_full }}_x86_64.zip"
+        # Nightly builds are the only packages that ship the GGUF frontend the OpenVINO
+        # backend links against. latest.txt maps each platform to the newest nightly URL,
+        # so we always pick up the most recent build without pinning a dated path.
+        if ("${{ inputs.channel }}" -eq "release") {
+          $url = "https://storage.openvinotoolkit.org/repositories/openvino/packages/${{ inputs.version_major }}/windows/openvino_toolkit_windows_${{ inputs.version_full }}_x86_64.zip"
+        } else {
+          $manifest = "https://storage.openvinotoolkit.org/repositories/openvino/packages/nightly/latest.txt"
+          $line = (Invoke-WebRequest -Uri $manifest -UseBasicParsing).Content -split "`n" | Where-Object { $_ -like "windows_x86_64:*" } | Select-Object -First 1
+          $url = $line -replace '^windows_x86_64:', ''
+          if (-not $url) { throw "Failed to resolve latest nightly OpenVINO URL from $manifest" }
+        }
+        Write-Host "Using OpenVINO package: $url"
         $out = "openvino.zip"
         Invoke-WebRequest -Uri $url -OutFile $out
         Expand-Archive -Path $out -DestinationPath ${{ inputs.path }} -Force

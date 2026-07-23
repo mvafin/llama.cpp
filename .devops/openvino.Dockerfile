@@ -1,5 +1,5 @@
-ARG OPENVINO_VERSION_MAJOR=2026.2.1
-ARG OPENVINO_VERSION_FULL=2026.2.1.21919.ede283a88e3
+# The OpenVINO backend links the GGUF frontend, which is only shipped by the nightly
+# packages, so we track the rolling nightly resolved from latest.txt at build time.
 ARG UBUNTU_VERSION=24.04
 
 # Intel GPU driver versions. https://github.com/intel/compute-runtime/releases
@@ -61,21 +61,19 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # OpenVINO toolkit and GPU/NPU drivers are cached via BuildKit cache mounts to avoid re-downloading on rebuilds.
-# Install OpenVINO for Ubuntu 24.04.
-ARG OPENVINO_VERSION_MAJOR
-ARG OPENVINO_VERSION_FULL
+# Install the latest OpenVINO nightly for Ubuntu 24.04 (URL resolved from latest.txt).
 RUN --mount=type=cache,target=/var/cache/openvino,sharing=locked \
     mkdir -p /opt/intel && \
-    TGZ=/var/cache/openvino/openvino_toolkit_ubuntu24_${OPENVINO_VERSION_FULL}_x86_64.tgz && \
-    if [ ! -f "$TGZ" ]; then \
-        wget -O "$TGZ" https://storage.openvinotoolkit.org/repositories/openvino/packages/${OPENVINO_VERSION_MAJOR}/linux/openvino_toolkit_ubuntu24_${OPENVINO_VERSION_FULL}_x86_64.tgz; \
-    fi && \
-    tar -xf "$TGZ" -C /opt/intel/ && \
-    mv /opt/intel/openvino_toolkit_ubuntu24_${OPENVINO_VERSION_FULL}_x86_64 /opt/intel/openvino_${OPENVINO_VERSION_MAJOR} && \
-    cd /opt/intel/openvino_${OPENVINO_VERSION_MAJOR} && \
+    URL=$(wget -qO- https://storage.openvinotoolkit.org/repositories/openvino/packages/nightly/latest.txt | grep '^ubuntu24_x86_64:' | cut -d: -f2-) && \
+    if [ -z "$URL" ]; then echo "Failed to resolve latest nightly OpenVINO URL" >&2; exit 1; fi && \
+    TGZ=/var/cache/openvino/$(basename "$URL") && \
+    if [ ! -f "$TGZ" ]; then wget -O "$TGZ" "$URL"; fi && \
+    mkdir -p /opt/intel/openvino_nightly && \
+    tar -xf "$TGZ" -C /opt/intel/openvino_nightly --strip-components=1 && \
+    cd /opt/intel/openvino_nightly && \
     echo "Y" | ./install_dependencies/install_openvino_dependencies.sh && \
     cd - && \
-    ln -s /opt/intel/openvino_${OPENVINO_VERSION_MAJOR} /opt/intel/openvino
+    ln -s /opt/intel/openvino_nightly /opt/intel/openvino
 
 ENV OpenVINO_DIR=/opt/intel/openvino
 

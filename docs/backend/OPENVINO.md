@@ -183,7 +183,11 @@ Although, the validated models below were tested with `llama-cli` using the `Q4_
 
 ### 1. Install OpenVINO Runtime
 
-- Follow the guide to install OpenVINO Runtime from an archive file: [Linux](https://docs.openvino.ai/2026/get-started/install-openvino/install-openvino-archive-linux.html) | [Windows](https://docs.openvino.ai/2026/get-started/install-openvino/install-openvino-archive-windows.html)
+> [!IMPORTANT]
+> The OpenVINO backend links the **GGUF frontend** (`openvino::frontend::gguf`), which is currently shipped only in the **nightly** OpenVINO packages, not in the numbered releases. Install a recent nightly build. The latest nightly archive URLs for every platform are listed in
+> [`nightly/latest.txt`](https://storage.openvinotoolkit.org/repositories/openvino/packages/nightly/latest.txt) — pick the `ubuntu24_x86_64` (or `windows_x86_64`) entry. The [Automated Ubuntu Build Script](#automated-ubuntu-build-script) below resolves and installs the latest nightly for you.
+
+- Alternatively, follow the archive-install guide (choosing a nightly package): [Linux](https://docs.openvino.ai/2026/get-started/install-openvino/install-openvino-archive-linux.html) | [Windows](https://docs.openvino.ai/2026/get-started/install-openvino/install-openvino-archive-windows.html)
 
 - Verify OpenVINO is initialized properly:
   ```bash
@@ -237,14 +241,14 @@ chmod +x ubuntu-llamacpp-ov-install.sh
 # ============================================
 set -euo pipefail
 
-OPENVINO_VERSION_MAJOR="2026.2.1"
-OPENVINO_VERSION_FULL="2026.2.1.21919.ede283a88e3"
+# The OpenVINO backend links the GGUF frontend, which is shipped only in the nightly
+# packages. Resolve the latest nightly ubuntu24 archive URL from latest.txt at run time.
+OPENVINO_MANIFEST="https://storage.openvinotoolkit.org/repositories/openvino/packages/nightly/latest.txt"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OPENVINO_INSTALL_DIR="/opt/intel/openvino_${OPENVINO_VERSION_MAJOR}"
+OPENVINO_INSTALL_DIR="/opt/intel/openvino_nightly"
 OPENVINO_LINK_DIR="/opt/intel/openvino"
 OPENVINO_TGZ="${SCRIPT_DIR}/openvino.tgz"
-OPENVINO_URL="https://storage.openvinotoolkit.org/repositories/openvino/packages/${OPENVINO_VERSION_MAJOR}/linux/openvino_toolkit_ubuntu24_${OPENVINO_VERSION_FULL}_x86_64.tgz"
 
 echo "============================================"
 echo "Installing prerequisites (apt)..."
@@ -272,13 +276,20 @@ if [[ ! -f "llama.cpp/CMakeLists.txt" ]]; then
 fi
 
 # ============================================
-# Setup OpenVINO: download & extract to /opt/intel/openvino_${OPENVINO_VERSION_MAJOR},
+# Setup OpenVINO: download the latest nightly & extract to /opt/intel/openvino_nightly,
 # then point /opt/intel/openvino at it via symlink so the active version is swappable.
+# Re-run this script to refresh to a newer nightly (remove the dir below first).
 # ============================================
+OPENVINO_URL="$(curl -fsSL "${OPENVINO_MANIFEST}" | grep '^ubuntu24_x86_64:' | cut -d: -f2-)"
+if [[ -z "${OPENVINO_URL}" ]]; then
+    echo "Failed to resolve latest nightly OpenVINO URL from ${OPENVINO_MANIFEST}" >&2
+    exit 1
+fi
+
 if [[ -f "${OPENVINO_INSTALL_DIR}/setupvars.sh" ]]; then
-    echo "OpenVINO ${OPENVINO_VERSION_MAJOR} already installed at ${OPENVINO_INSTALL_DIR}. Skipping download."
+    echo "OpenVINO already installed at ${OPENVINO_INSTALL_DIR}. Skipping download."
 else
-    echo "OpenVINO not found at ${OPENVINO_INSTALL_DIR}. Starting download..."
+    echo "Downloading latest OpenVINO nightly: ${OPENVINO_URL}"
     curl -L -o "${OPENVINO_TGZ}" "${OPENVINO_URL}"
 
     echo "Extracting OpenVINO to ${OPENVINO_INSTALL_DIR}..."
@@ -287,7 +298,7 @@ else
     rm -f "${OPENVINO_TGZ}"
 fi
 
-# Refresh symlink: /opt/intel/openvino -> /opt/intel/openvino_${OPENVINO_VERSION_MAJOR}
+# Refresh symlink: /opt/intel/openvino -> /opt/intel/openvino_nightly
 sudo ln -sfn "${OPENVINO_INSTALL_DIR}" "${OPENVINO_LINK_DIR}"
 
 OPENVINO_ROOT="${OPENVINO_LINK_DIR}"
@@ -334,7 +345,7 @@ echo "  ./build/ReleaseOV/bin/llama-cli -m model.gguf"
 ```
 
 > [!NOTE]
-> The script pins OpenVINO `2026.2.1` via the `OPENVINO_VERSION_MAJOR` / `OPENVINO_VERSION_FULL` variables at the top — edit them to track a different release.
+> The script installs the latest OpenVINO **nightly** (resolved from `latest.txt`), since the GGUF frontend the backend links is shipped only in nightly packages. Delete `/opt/intel/openvino_nightly` and re-run to refresh to a newer nightly.
 
 </details>
 
@@ -364,16 +375,17 @@ REM ============================================
 REM llama.cpp OpenVINO Build Script (Ninja)
 REM ============================================
 
-set "OPENVINO_VERSION_MAJOR=2026.2.1"
-set "OPENVINO_VERSION_FULL=2026.2.1.21919.ede283a88e3"
+REM The OpenVINO backend links the GGUF frontend, which is shipped only in the nightly
+REM packages. Resolve the latest nightly windows archive URL from latest.txt at run time.
+set "OPENVINO_MANIFEST=https://storage.openvinotoolkit.org/repositories/openvino/packages/nightly/latest.txt"
 
 set "SCRIPT_DIR=%~dp0"
 set "VCPKG_DIR=C:\vcpkg"
-set "OPENVINO_INSTALL_DIR=C:\Intel\openvino_%OPENVINO_VERSION_MAJOR%"
+set "OPENVINO_INSTALL_DIR=C:\Intel\openvino_nightly"
 set "OPENVINO_LINK_DIR=C:\Intel\openvino"
 set "OPENVINO_ZIP=%SCRIPT_DIR%openvino.zip"
 set "OPENVINO_EXTRACT_TMP=%SCRIPT_DIR%openvino_extract_tmp"
-set "OPENVINO_URL=https://storage.openvinotoolkit.org/repositories/openvino/packages/%OPENVINO_VERSION_MAJOR%/windows/openvino_toolkit_windows_%OPENVINO_VERSION_FULL%_x86_64.zip"
+for /f "usebackq delims=" %%u in (`powershell -NoProfile -Command "((Invoke-WebRequest -UseBasicParsing '%OPENVINO_MANIFEST%').Content -split \"`n\" | Where-Object { $_ -like 'windows_x86_64:*' } | Select-Object -First 1) -replace '^windows_x86_64:',''"`) do set "OPENVINO_URL=%%u"
 
 echo ============================================
 echo Installing prerequisites...
@@ -432,10 +444,15 @@ REM Setup OpenVINO: download & extract to C:\Intel\openvino_%OPENVINO_VERSION_MA
 REM then point C:\Intel\openvino at it via a directory junction (mklink /J).
 REM ============================================
 
+if not defined OPENVINO_URL (
+    echo ERROR: Could not resolve latest nightly OpenVINO URL from "%OPENVINO_MANIFEST%".
+    exit /b 1
+)
+
 if exist "%OPENVINO_INSTALL_DIR%\setupvars.bat" (
-    echo OpenVINO %OPENVINO_VERSION_MAJOR% already installed at "%OPENVINO_INSTALL_DIR%". Skipping download.
+    echo OpenVINO already installed at "%OPENVINO_INSTALL_DIR%". Skipping download.
 ) else (
-    echo OpenVINO not found at "%OPENVINO_INSTALL_DIR%". Starting download...
+    echo Downloading latest OpenVINO nightly: %OPENVINO_URL%
 
     curl -L -o "%OPENVINO_ZIP%" "%OPENVINO_URL%"
     if errorlevel 1 (
@@ -547,7 +564,7 @@ endlocal
 ```
 
 > [!NOTE]
-> The script pins OpenVINO `2026.2.1` via the `OPENVINO_VERSION_MAJOR` / `OPENVINO_VERSION_FULL` variables at the top — edit them to track a different release. From any new shell, source the matching `setupvars` script via the junction — `call "C:\Intel\openvino\setupvars.bat"` from `cmd`, or `& "C:\Intel\openvino\setupvars.ps1"` from PowerShell. If `winget` cannot register Visual Studio Build Tools on first run, install them once manually and re-run the script from an elevated **Developer Command Prompt for VS 2022**.
+> The script installs the latest OpenVINO **nightly** (resolved from `latest.txt`), since the GGUF frontend the backend links is shipped only in nightly packages. Delete `C:\Intel\openvino_nightly` and re-run to refresh to a newer nightly. From any new shell, source the matching `setupvars` script via the junction — `call "C:\Intel\openvino\setupvars.bat"` from `cmd`, or `& "C:\Intel\openvino\setupvars.ps1"` from PowerShell. If `winget` cannot register Visual Studio Build Tools on first run, install them once manually and re-run the script from an elevated **Developer Command Prompt for VS 2022**.
 
 </details>
 

@@ -266,22 +266,17 @@ jobs:
   gpu-openvino-low-perf:
     runs-on: [self-hosted, Linux, Intel, OpenVINO]
 
-    env:
-      # Sync versions in build.yml, build-self-hosted.yml, release.yml, build-cache.yml, .devops/openvino.Dockerfile
-      OPENVINO_VERSION_MAJOR: "2026.2.1"
-      OPENVINO_VERSION_FULL: "2026.2.1.21919.ede283a88e3"
-
     steps:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
 
+      # The OpenVINO backend links the GGUF frontend, which is only shipped by the
+      # nightly packages (the default channel of this action), so no version is pinned.
       - name: Setup OpenVINO Toolkit
         uses: ./.github/actions/linux-setup-openvino
         with:
           path: ./openvino_toolkit
-          version_major: ${{ env.OPENVINO_VERSION_MAJOR }}
-          version_full: ${{ env.OPENVINO_VERSION_FULL }}
 
       - name: Install OpenVINO dependencies
         run: |

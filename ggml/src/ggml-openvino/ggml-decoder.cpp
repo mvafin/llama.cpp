@@ -2015,6 +2015,10 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
         // GGML_OP_FILL stores the scalar fill constant as a float in op_params[0].
         return ggml_get_op_params_f32(info.node, 0);
     }
+    if (name == "gdn_state_slots") {
+        // GGML_OP_GATED_DELTA_NET stores K, the recurrent-state snapshot count, in op_params[0].
+        return static_cast<int64_t>(ggml_get_op_params_i32(info.node, 0));
+    }
     if (name == "set_offset_elems") {
         // GGML_OP_SET writes src[1] into a contiguous region of src[0]'s flattened buffer. Its
         // op_params are { nb1, nb2, nb3, offset_bytes, inplace }; op_params[3] is the destination

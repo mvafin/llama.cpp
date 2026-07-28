@@ -983,8 +983,8 @@ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, con
 
     static std::set<ggml_type> supported_types{GGML_TYPE_F32,  GGML_TYPE_F16,  GGML_TYPE_BF16, GGML_TYPE_I64,
                                                GGML_TYPE_I32,  GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K,
-                                               GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_1,
-                                               GGML_TYPE_MXFP4};
+                                               GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_0,
+                                               GGML_TYPE_Q5_1, GGML_TYPE_MXFP4};
     // DEBUG bisection seam: GGML_OPENVINO_DISABLE_TYPES is a comma-separated list of ggml type names
     // (e.g. "Q8_0,Q6_K"). Any op whose output or a source is one of those types is forced onto the
     // ggml CPU reference, isolating a suspect quant path. See docs/debugging_accuracy.md.

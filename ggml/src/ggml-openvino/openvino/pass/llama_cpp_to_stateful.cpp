@@ -79,12 +79,14 @@ ReadChain find_read_chain(const std::shared_ptr<ov::Node>& set_rows) {
 
 // Reslice the attention mask for the append-grown KV: slice over the last two axes to
 // [token_len_per_seq, last_pos + 1] instead of the stateless fixed-attention_size slice.
-void rewire_stateful_mask(const std::shared_ptr<ov::Model>& model, const std::string& mask_sliced_name) {
+void rewire_stateful_mask(const std::shared_ptr<ov::Model>& model,
+                          const std::string& mask_name,
+                          const std::string& mask_sliced_name) {
     auto sliced = find_by_name(model, mask_sliced_name);
     if (!sliced) {
         return;
     }
-    auto mask = find_by_name(model, "self_kq_mask");
+    auto mask = find_by_name(model, mask_name);
     auto token_len = find_by_name(model, "token_len_per_seq");
     auto inp_pos = find_by_name(model, "inp_pos");
     if (!mask || !token_len || !inp_pos) {
@@ -124,8 +126,12 @@ bool LlamaCppToStateful::run_on_model(const std::shared_ptr<ov::Model>& model) {
         }
         // Only KV-cache writes (dst is a Parameter, output read by attention) become stateful.
         // Non-KV SetRows (e.g. MoE) are left for the frontend's default stateless lowering.
-        if (!ov::as_type_ptr<ov::op::v0::Parameter>(set_rows->input_value(2).get_node_shared_ptr())) {
+        auto dst = ov::as_type_ptr<ov::op::v0::Parameter>(set_rows->input_value(2).get_node_shared_ptr());
+        if (!dst) {
             continue;
+        }
+        if (m_skip_caches.count(dst->get_friendly_name())) {
+            continue;  // sliding-window cache: stays stateless (see the constructor comment)
         }
         auto chain = find_read_chain(set_rows);
         if (!chain.transpose) {
@@ -190,8 +196,12 @@ bool LlamaCppToStateful::run_on_model(const std::shared_ptr<ov::Model>& model) {
         model->remove_parameter(p);
     }
 
-    rewire_stateful_mask(model, "KQ_mask_sliced");
-    rewire_stateful_mask(model, "KQ_mask_swa_sliced");
+    rewire_stateful_mask(model, "self_kq_mask", "KQ_mask_sliced");
+    // The SWA mask is only reslid when the sliding-window caches themselves went stateful. When they
+    // were skipped, their reads still window a fixed-size cache and must keep the stateless slice.
+    if (m_skip_caches.empty()) {
+        rewire_stateful_mask(model, "self_kq_mask_swa", "KQ_mask_swa_sliced");
+    }
 
     model->validate_nodes_and_infer_types();
     return true;

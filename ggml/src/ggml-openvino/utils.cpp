@@ -235,7 +235,7 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
             ov::frontend::gguf::FrontEnd frontend;
             if (stateful) {
                 frontend.add_extension(std::make_shared<ov::frontend::DecoderTransformationExtension>(
-                    ggml::pass::LlamaCppToStateful()));
+                    ggml::pass::LlamaCppToStateful(ggml_decoder->get_swa_kv_names())));
             }
             model = frontend.convert(
                 frontend.load(std::static_pointer_cast<ov::frontend::gguf::GgufDecoder>(ggml_decoder)));

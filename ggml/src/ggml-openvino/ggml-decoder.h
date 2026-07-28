@@ -25,12 +25,28 @@ struct ModelParams {
     int n_heads_kv = -1;
     int head_size = -1;
     int state_size = -1;  // recurrent-state row width for SSM/DeltaNet models (qwen3-next); -1 = not recurrent
-    int32_t rope_params[15];
+    // The first ROPE op's op_params, used to build the shared sin/cos table. Zero-initialized so a
+    // graph with no ROPE op (an embedding-only graph, or the small-subgraph path whose bare decoder
+    // never runs compute_llm_params) yields n_dims == 0, which the frontend reads as "model uses no
+    // RoPE" -- rather than stack garbage, which produces an absurd sin/cos width (a float bit
+    // pattern read as an int) and a broadcast failure inside the first ROPE.
+    int32_t rope_params[15] = {};
     // Set when the graph's ROPE ops carry divergent op_params (e.g. gemma4's SWA vs global layers
     // use different n_dims / freq_base). The frontend maps this to RopeConfig::per_op so each ROPE
     // op builds its own sin/cos instead of sharing a single precomputed table.
     bool mixed_rope_params = false;
     std::vector<int> swa_layers;
+    // The sliding-window attention mask tensor, when this graph is an iSWA model (gemma3/gemma4).
+    // llama.cpp builds both masks through one shared build_attn_inp_kq_mask helper, so both are
+    // named "attn_inp_kq_mask" and the name cannot tell them apart -- they are distinct tensors
+    // though, so identity is the discriminator. nullptr = no SWA layers in this graph.
+    // swa_mask_src is the pre-staging graph input when the mask reaches attention through a CPY.
+    const ggml_tensor * swa_mask = nullptr;
+    const ggml_tensor * swa_mask_src = nullptr;
+
+    bool is_swa_mask(const ggml_tensor * mask) const {
+        return mask != nullptr && (mask == swa_mask || mask == swa_mask_src);
+    }
 
     std::vector<std::string> kv_names;
     size_t kv_buffer_ctx_id = 0;
@@ -167,6 +183,10 @@ public:
     // Not part of the GgufDecoder frontend interface.
     std::map<std::string, std::string> get_kv_param_res_names() const;
 
+    // Names of the KV caches belonging to sliding-window layers. Empty unless this graph is iSWA.
+    // The stateful lowering leaves these stateless -- see LlamaCppToStateful's constructor.
+    std::set<std::string> get_swa_kv_names() const;
+
 
     ov::PartialShape get_graph_input_shape(const ggml_tensor * op, const ggml_tensor * input) const;
 
@@ -247,7 +267,9 @@ public:
                op->src[0]->buffer != nullptr && op->src[0]->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY;
     }
 
-    static std::string get_graph_input_ov_name(const ggml_tensor * tensor, const ggml_tensor * op) {
+    // Not static: telling the two attention masks of an iSWA model apart needs the whole-graph
+    // classification in m_model_params (see ModelParams::swa_mask).
+    std::string get_graph_input_ov_name(const ggml_tensor * tensor, const ggml_tensor * op) const {
         if (is_inp_tok(tensor, op)) {
             return "inp_tokens";
         }
@@ -261,7 +283,7 @@ public:
             return "inp_out_ids";
         }
         if (is_inp_mask(tensor, op)) {
-            return std::string(tensor->name).find("swa") == std::string::npos ? "self_kq_mask" : "self_kq_mask_swa";
+            return m_model_params.is_swa_mask(tensor) ? "self_kq_mask_swa" : "self_kq_mask";
         }
         return tensor->name;
     }

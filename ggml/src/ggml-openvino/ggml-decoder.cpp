@@ -735,69 +735,132 @@ int extract_layer_from_name(const std::string & name) {
     return layer;
 }
 
+namespace {
+// Walk a FLASH_ATTN_EXT's K input back to the K-cache leaf it views:
+//   src[1] -> [CPY] -> PERMUTE -> VIEW -> cache_k_l<N>
+// Returns nullptr when the chain does not match, so callers that only need a best-effort
+// classification can skip the node instead of failing.
+const ggml_tensor * attn_kvcache_view(const ggml_tensor * attn) {
+    const ggml_tensor * perm = attn->src[1];
+    if (perm != nullptr && perm->op == GGML_OP_CPY) {
+        perm = perm->src[0];
+    }
+    if (perm == nullptr || perm->op != GGML_OP_PERMUTE || perm->src[0] == nullptr ||
+        perm->src[0]->op != GGML_OP_VIEW || perm->src[0]->src[0] == nullptr) {
+        return nullptr;
+    }
+    return perm->src[0];
+}
+
+const ggml_tensor * attn_kvcache(const ggml_tensor * attn) {
+    const ggml_tensor * view = attn_kvcache_view(attn);
+    return view == nullptr ? nullptr : view->src[0];
+}
+}  // namespace
+
 std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgraph * cgraph, bool is_static) {
     ModelParams model_params;
     ComputeParams compute_params;
     bool seen_rope = false;
 
-    // Rope-divergence pre-scan over the WHOLE graph. This must run before the main loop, which
-    // breaks at the first FLASH_ATTN_EXT (layer 0) and would otherwise never see the ROPE ops of
-    // later layers. gemma4-style models interleave SWA layers (small n_dims / freq_base_swa) with
-    // global layers (large n_dims / freq_base); if any two ROPE ops disagree we must set
-    // mixed_rope_params so the frontend builds per-op sin/cos instead of one shared table (a shared
-    // SWA-width table otherwise mismatches a global layer's rope, e.g. rope_sin[128] vs Split[256]).
+    // Sliding-window-mask pre-scan over the WHOLE graph. It must run before the main loop, which
+    // consults model_params.swa_mask to classify each attention node.
+    //
+    // An iSWA model (gemma3/gemma4) feeds its SWA layers a different mask tensor than its global
+    // layers, but llama.cpp builds both through the same build_attn_inp_kq_mask helper, so both are
+    // named "attn_inp_kq_mask" and the name cannot tell them apart. Discriminate structurally
+    // instead: the two flavors read K caches of different lengths (n_swa rows vs n_ctx rows) and the
+    // shorter cache is the sliding-window one. Fall back to the masks' own widths when the K cache
+    // is not reachable (the "-fa off" softmax path), where the SWA mask is likewise the narrower.
+    // A single-flavor model leaves swa_mask null and takes the global path throughout.
     {
-        bool seen_rope_scan = false;
-        int32_t first_rope_params[15];
+        struct MaskInfo {
+            const ggml_tensor * mask;
+            const ggml_tensor * cache_k;  // K cache this mask's attention reads; nullptr = unknown
+        };
+        std::vector<MaskInfo> masks;
         for (int i = 0; i < cgraph->n_nodes; i++) {
-            auto * node = cgraph->nodes[i];
-            if (node->op != GGML_OP_ROPE) {
+            const auto * node = cgraph->nodes[i];
+            const ggml_tensor * mask = nullptr;
+            const ggml_tensor * cache_k = nullptr;
+            if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+                mask = node->src[3];
+                cache_k = attn_kvcache(node);
+            } else if (node->op == GGML_OP_SOFT_MAX) {
+                mask = node->src[1];
+            }
+            if (mask == nullptr) {
                 continue;
             }
-            if (!seen_rope_scan) {
-                memcpy(first_rope_params, node->op_params, sizeof(int32_t) * 15);
-                seen_rope_scan = true;
-            } else if (memcmp(first_rope_params, node->op_params, sizeof(int32_t) * 15) != 0) {
-                model_params.mixed_rope_params = true;
-                break;
+            auto it =
+                std::find_if(masks.begin(), masks.end(), [mask](const MaskInfo & m) { return m.mask == mask; });
+            if (it == masks.end()) {
+                masks.push_back({mask, cache_k});
+            } else if (it->cache_k == nullptr) {
+                it->cache_k = cache_k;
             }
+        }
+        if (masks.size() == 2) {
+            const ggml_tensor * a = masks[0].mask;
+            const ggml_tensor * b = masks[1].mask;
+            const ggml_tensor * ka = masks[0].cache_k;
+            const ggml_tensor * kb = masks[1].cache_k;
+            // llama.cpp allocates the sliding-window cache n_swa rows and the global one n_ctx rows,
+            // so the shorter cache is the sliding-window one. Only the row *count* may differ: the
+            // stream count must agree (same batch of sequences), while the row *width* may not (a
+            // model can use different KV head counts per layer flavor -- gemma4's SWA rows are 512
+            // wide against its global 1024).
+            if (ka != nullptr && kb != nullptr) {
+                if (ka->ne[2] == kb->ne[2] && ka->ne[1] != kb->ne[1]) {
+                    model_params.swa_mask = ka->ne[1] < kb->ne[1] ? a : b;
+                }
+            } else if (a->ne[1] == b->ne[1] && a->ne[3] == b->ne[3] && a->ne[0] != b->ne[0]) {
+                // No cache reachable (the "-fa off" softmax path): the masks themselves differ only
+                // in width, and the sliding-window one is the narrower.
+                model_params.swa_mask = a->ne[0] < b->ne[0] ? a : b;
+            }
+        }
+        // A mask staged through a CPY reaches attention as the CPY's output, while the graph *input*
+        // (what get_graph_input_ov_name is asked about) is its source. Record both identities.
+        if (model_params.swa_mask != nullptr && model_params.swa_mask->op == GGML_OP_CPY) {
+            model_params.swa_mask_src = model_params.swa_mask->src[0];
         }
     }
 
+    // Every FLASH_ATTN_EXT is visited, not just the first: an iSWA model carries two attention
+    // flavors, each with its own ctx_per_seq / attention_size, and its full layer list has to be
+    // collected in swa_layers. Fields that are the same for every layer (head geometry, token
+    // counts) are simply written repeatedly with the same value.
+    bool seen_attn = false;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         auto * node = cgraph->nodes[i];
         std::string name = std::string(node->name);
         if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            auto * cache_k_view = attn_kvcache_view(node);
+            auto * mask = node->src[3];
+            if (cache_k_view == nullptr || mask == nullptr) {
+                continue;  // not the KV-cache attention pattern this scan describes
+            }
+            seen_attn = true;
+
             model_params.n_heads = node->src[0]->ne[2];
             model_params.n_heads_kv = node->src[1]->ne[2];
             model_params.head_size = node->src[0]->ne[0];
             compute_params.input_len = node->src[0]->ne[1];
 
-            auto * cache_k_perm = node->src[1];
-            if (cache_k_perm->op == GGML_OP_CPY) {
-                cache_k_perm = cache_k_perm->src[0];
-            }
-            // Hard checks (not assert): under NDEBUG a violated K-cache shape assumption would
-            // otherwise walk src[0] on the wrong op and read garbage instead of failing cleanly.
-            if (cache_k_perm->op != GGML_OP_PERMUTE || cache_k_perm->src[0] == nullptr ||
-                cache_k_perm->src[0]->op != GGML_OP_VIEW || cache_k_perm->src[0]->src[0] == nullptr) {
-                throw std::runtime_error("compute_llm_params: unexpected FLASH_ATTN_EXT K-cache pattern for node " +
-                                         std::string(node->name));
-            }
-            auto * cache_k_view = cache_k_perm->src[0];
-
             auto * cache_k = cache_k_view->src[0];
             int layer = extract_layer_from_name(cache_k->name);
-            auto * mask = node->src[3];
-            std::string mask_name(mask->name);
+            const bool is_swa = model_params.is_swa_mask(mask);
 
             model_params.kv_buffer_ctx_id = ggml_backend_openvino_buffer_get_ctx_id(cache_k->buffer);
-            if (mask_name.find("swa") != std::string::npos) {
+            if (is_swa) {
                 model_params.swa_layers.push_back(layer);
                 model_params.ctx_per_seq_swa = cache_k->ne[1];
+                compute_params.attention_size_swa = mask->ne[0];
             } else {
                 model_params.ctx_per_seq = cache_k->ne[1];
                 model_params.n_seq = cache_k->ne[2];
+                compute_params.attention_size = mask->ne[0];
             }
 
             compute_params.n_seq_active = mask->ne[3];
@@ -806,26 +869,18 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
             memcpy(&offset, cache_k_view->op_params, sizeof(size_t));
             compute_params.seq_active_start = offset / seq_size;
             compute_params.token_len_per_seq = node->ne[2];
-
-            if (mask_name.find("swa") != std::string::npos) {
-                compute_params.attention_size_swa = mask->ne[0];
-            } else {
-                compute_params.attention_size = mask->ne[0];
-            }
-            if (is_static) {
-                compute_params.attention_size = model_params.ctx_per_seq;
-                compute_params.attention_size_swa = model_params.ctx_per_seq_swa;
-                compute_params.token_len_per_seq = 1;
-            }
-            break;
         }
         if (node->op == GGML_OP_ROPE) {
-            // Capture the first ROPE op's params for the shared-table case (non-mixed models).
-            // mixed_rope_params is decided by the whole-graph pre-scan above, not here (this loop
-            // breaks at the first FLASH_ATTN_EXT and never sees later layers' ROPE ops).
+            // The first ROPE op's params drive the shared sin/cos table. gemma4-style models
+            // interleave SWA layers (small n_dims / freq_base_swa) with global layers (large n_dims /
+            // freq_base); if any two ROPE ops disagree, one shared table cannot serve both (an
+            // SWA-width table mismatches a global layer's rope, e.g. rope_sin[128] vs Split[256]), so
+            // mixed_rope_params tells the frontend to build sin/cos per op instead.
             if (!seen_rope) {
                 memcpy(model_params.rope_params, node->op_params, sizeof(int32_t) * 15);
                 seen_rope = true;
+            } else if (memcmp(model_params.rope_params, node->op_params, sizeof(int32_t) * 15) != 0) {
+                model_params.mixed_rope_params = true;
             }
             // Fallback token count for the "-fa off" (softmax) path, where the FLASH_ATTN_EXT
             // branch that normally sets input_len does not run: inp_pos (ROPE src[1]) has one
@@ -869,6 +924,15 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
                 }
             }
         }
+    }
+
+    // NPU compiles one static shape, so attention spans the whole preallocated cache rather than the
+    // current ubatch's mask width. Applied after the loop: it needs the final ctx_per_seq of BOTH
+    // attention flavors, which an iSWA graph only has once every layer has been visited.
+    if (is_static && seen_attn) {
+        compute_params.attention_size = model_params.ctx_per_seq;
+        compute_params.attention_size_swa = model_params.ctx_per_seq_swa;
+        compute_params.token_len_per_seq = 1;
     }
 
     auto * output_tensor = cgraph->nodes[cgraph->n_nodes - 1];
@@ -1550,10 +1614,27 @@ const ggml_tensor * GgmlOvDecoder::get_tensor_used_op(const ggml_tensor * tensor
 
 std::map<std::string, std::string> GgmlOvDecoder::get_kv_param_res_names() const {
     std::map<std::string, std::string> kv_param_res_names;
+    const auto swa_names = get_swa_kv_names();
     for (const auto & name : m_model_params.kv_names) {
-        kv_param_res_names[name] = name;
+        // A sliding-window cache stays stateless, so it has no state to look up here.
+        if (swa_names.count(name) == 0) {
+            kv_param_res_names[name] = name;
+        }
     }
     return kv_param_res_names;
+}
+
+std::set<std::string> GgmlOvDecoder::get_swa_kv_names() const {
+    std::set<std::string> names;
+    if (m_model_params.swa_layers.empty()) {
+        return names;
+    }
+    for (const auto & name : m_model_params.kv_names) {
+        if (is_swa_layer(extract_layer_from_name(name))) {
+            names.insert(name);
+        }
+    }
+    return names;
 }
 
 std::shared_ptr<ov::Node> GgmlOvDecoder::create_weight_node(ggml_tensor * tensor, bool naive) {
@@ -2291,9 +2372,10 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
                                                         : info.node_inputs.at(info.node_inputs_names[0]));
     }
     if (name == "is_swa") {
-        // FLASH_ATTN_EXT: mask input (src[3]) name contains "swa" for SWA layers.
-        if (info.node->op == GGML_OP_FLASH_ATTN_EXT && info.node->src[3] != nullptr) {
-            return std::string(info.node->src[3]->name).find("swa") != std::string::npos;
+        // FLASH_ATTN_EXT: the mask input (src[3]) identifies the layer flavor -- see
+        // ModelParams::swa_mask for why identity, not the name, is the discriminator.
+        if (info.node->op == GGML_OP_FLASH_ATTN_EXT) {
+            return m_model_params.is_swa_mask(info.node->src[3]);
         }
         return false;
     }

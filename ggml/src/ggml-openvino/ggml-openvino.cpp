@@ -167,12 +167,17 @@ static enum ggml_status ggml_backend_openvino_buffer_init_tensor(ggml_backend_bu
         tensor->data = (char *) ctx->data + ((char *) tensor->data - (char *) data_prev);
     }
 
-    // Views share the extra from view_src
+    // A view's logical data lives in view_src's allocation, so it does not get its own extra here.
+    // Do NOT snapshot view_src->extra into tensor->extra: the base tensor's extra object is
+    // replaced (old one deleted, new one allocated) whenever its data is (re)written via
+    // ggml_backend_openvino_buffer_set_tensor, e.g. for a leaf tensor like an index buffer that a
+    // view slices without itself going through set_tensor (ggml_is_view_op leaves are typically
+    // skipped by callers that (re)initialize tensor contents). A snapshot taken here would go
+    // stale/dangling the moment that happens, and reading its ->type back would be undefined
+    // behavior -- readers resolve view_src's *current* extra live instead (see
+    // convert_ggml_input_to_ov).
     if (tensor->view_src != nullptr) {
         GGML_ASSERT(tensor->view_src->buffer->buft == buffer->buft);
-        if (tensor->view_src->extra != nullptr) {
-            tensor->extra = tensor->view_src->extra;
-        }
         return GGML_STATUS_SUCCESS;
     }
 

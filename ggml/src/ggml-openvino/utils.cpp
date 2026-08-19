@@ -27,6 +27,7 @@
 #include <openvino/core/shape.hpp>
 #include <openvino/core/type/float16.hpp>
 #include <openvino/frontend/manager.hpp>
+#include <openvino/op/parameter.hpp>
 #include <openvino/openvino.hpp>
 #include <openvino/runtime/compiled_model.hpp>
 #include <openvino/runtime/infer_request.hpp>
@@ -98,6 +99,67 @@ ov::Tensor create_ov_output_tensor(std::shared_ptr<GgmlOvDecoder> ggml_decoder,
     return output_tensor;
 }
 
+namespace {
+// graph_key (n_nodes + first/last node name) is too coarse to distinguish graphs that share that
+// shape but differ in every tensor's type/size -- e.g. test-backend-ops's ADD_ID sweep, which
+// builds a fresh {a, b, ids, (view_of_ids), out} graph per {type_a, type_b, n_embd, n_experts,
+// n_experts_used, n_token} combination, all with identical node count and "out" as both first and
+// last node name. can_reuse_dynamically() only compares RoPE params (irrelevant to non-LLM
+// graphs), so those combinations collide on the same cache entry and the compiled model gets fed
+// a tensor of the wrong precision/shape -- observed as an OpenVINO ParameterMismatch exception or
+// worse, a crash. Guard the reuse decision with a cheap structural check: every previously
+// registered model input's element type must match the same-named tensor in the incoming cgraph,
+// and any statically-known shape dimension must agree too (dynamic dims -- the token axis a real
+// decode loop varies every step -- are always allowed to differ; that's the whole point of the
+// cache).
+bool ggml_decoder_inputs_compatible(const std::shared_ptr<GgmlOvDecoder> & decoder, const ggml_cgraph * cgraph) {
+    std::unordered_map<std::string, const ggml_tensor *> by_name;
+    auto visit = [&](const ggml_tensor * t) {
+        if (t != nullptr && t->name[0] != '\0') {
+            by_name.emplace(t->name, t);
+        }
+    };
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const auto * node = cgraph->nodes[i];
+        visit(node);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            visit(node->src[j]);
+        }
+    }
+
+    for (const auto & input : decoder->get_model_inputs()) {
+        auto param = std::dynamic_pointer_cast<ov::op::v0::Parameter>(input.second);
+        if (!param) {
+            continue;
+        }
+        auto it = by_name.find(input.first);
+        if (it == by_name.end()) {
+            // A previously registered model input has no same-named counterpart in the incoming
+            // cgraph at all -- these are two structurally unrelated graphs that merely collided on
+            // graph_key (e.g. one earlier op's test case and a later, differently-shaped one, both
+            // ending on a node named "out"). Never reuse across that.
+            return false;
+        }
+        if (GgmlOvDecoder::get_ov_type(it->second) != param->get_element_type()) {
+            return false;
+        }
+        const auto & pshape = param->get_partial_shape();
+        if (pshape.rank().is_static()) {
+            auto shape = GgmlOvDecoder::get_shape(it->second);
+            if (shape.size() != pshape.size()) {
+                return false;
+            }
+            for (size_t d = 0; d < shape.size(); d++) {
+                if (pshape[d].is_static() && static_cast<int64_t>(shape[d]) != pshape[d].get_length()) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+}  // namespace
+
 enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<ov_runtime_context> r_ctx) {
     auto & core = ov_singleton_core();
     const auto & config = ggml_openvino_get_compile_config();
@@ -147,7 +209,8 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
         if (cache_hit) {
             ggml_decoder = entry->ptr;
             old_m_params = ggml_decoder->get_model_params();
-            cache_hit = old_m_params.can_reuse_dynamically(m_params);
+            cache_hit = old_m_params.can_reuse_dynamically(m_params) &&
+                        ggml_decoder_inputs_compatible(ggml_decoder, cgraph);
         }
 
         if (cache_hit) {
@@ -410,7 +473,8 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, std::shared_ptr<o
     if (cache_hit) {
         ggml_decoder = entry->ptr;
         old_m_params = ggml_decoder->get_model_params();
-        cache_hit = old_m_params.can_reuse_statically(m_params);
+        cache_hit = old_m_params.can_reuse_statically(m_params) &&
+                    ggml_decoder_inputs_compatible(ggml_decoder, cgraph);
     }
 
     if (cache_hit) {
@@ -679,9 +743,18 @@ namespace {
 ov::Tensor convert_ggml_input_to_ov(std::shared_ptr<GgmlOvDecoder> ggml_decoder, const std::string & name) {
     const auto * ggml_tensor = ggml_decoder->get_input_ggml_tensor(name);
 
-    if (ggml_tensor->extra != nullptr) {
-        // GGML_LOG_DEBUG("Using ggml_tensor->extra as ov::Tensor for input: %s\n", name.c_str());
-        auto * extra_base = static_cast<ggml_openvino_extra_base *>(ggml_tensor->extra);
+    // A view never carries its own extra (see ggml_backend_openvino_buffer_init_tensor); resolve
+    // view_src's *current* extra live here instead of relying on a value cached at some earlier
+    // point, which could have gone stale if view_src's extra was replaced since (e.g. its data was
+    // (re)written via ggml_backend_openvino_buffer_set_tensor, which installs a fresh extra object
+    // and frees the old one).
+    const auto * extra_src = ggml_tensor;
+    while (extra_src->extra == nullptr && extra_src->view_src != nullptr) {
+        extra_src = extra_src->view_src;
+    }
+
+    if (extra_src->extra != nullptr) {
+        auto * extra_base = static_cast<ggml_openvino_extra_base *>(extra_src->extra);
         if (extra_base->type != ggml_openvino_extra_base::Type::TENSOR) {
             throw std::runtime_error("ggml tensor extra is not of type TENSOR for input: " + name);
         }

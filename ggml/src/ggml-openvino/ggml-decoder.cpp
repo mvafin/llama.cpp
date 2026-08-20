@@ -50,6 +50,25 @@ bool is_inplace_op(const ggml_tensor * node) {
            (node->op == GGML_OP_SCALE && node->view_src != nullptr);
 }
 
+bool is_conv_states_all_tensor(const ggml_tensor * tensor) {
+    return tensor != nullptr && strncmp(tensor->name, "conv_states_all", strlen("conv_states_all")) == 0;
+}
+
+bool is_conv_state_writeback(const ggml_tensor * node) {
+    return node->op == GGML_OP_CPY && node->view_src != nullptr && GgmlOvDecoder::is_kvcache(node->view_src, nullptr) &&
+           node->src[0] != nullptr && node->src[0]->op == GGML_OP_VIEW && node->src[0]->src[0] != nullptr &&
+           node->src[0]->src[0]->op == GGML_OP_CONCAT && node->src[1] != nullptr && node->src[1]->op == GGML_OP_VIEW &&
+           node->src[1]->view_src == node->view_src;
+}
+
+std::string recurrent_writeback_name(const ggml_cgraph * cgraph, const ggml_tensor * tensor) {
+    const size_t hash_pos = ggml_hash_find(&cgraph->visited_hash_set, tensor);
+    if (hash_pos != GGML_HASHSET_FULL && ggml_bitset_get(cgraph->visited_hash_set.used, hash_pos)) {
+        return std::string(tensor->name) + "#" + std::to_string(hash_pos);
+    }
+    return tensor->name;
+}
+
 // A VIEW's byte offset (op_params[0..1] as size_t).
 size_t view_byte_offset(const ggml_tensor * node) {
     size_t byte_offset = 0;
@@ -341,6 +360,7 @@ void GgmlOvDecoder::set_input_output() {
     // its consumer.
     m_tensor_unique_name.clear();
     m_used_names.clear();
+    std::set<const ggml_tensor *> injected_external_views;
     {
         std::set<std::string> & seen_weights = m_weight_names;
         seen_weights.clear();
@@ -356,8 +376,9 @@ void GgmlOvDecoder::set_input_output() {
                     src_name = "rope_freqs.weight";
                 }
                 ggml_backend_buffer * buffer = src->buffer;
-                const bool is_weight =
-                    buffer && (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS || ggml_is_quantized(src->type));
+                const bool is_weight = is_rope_freqs_weight(src, node) ||
+                                       (buffer && (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                                                   ggml_is_quantized(src->type)));
                 if (!is_weight || seen_weights.count(src_name)) {
                     continue;
                 }
@@ -390,68 +411,33 @@ void GgmlOvDecoder::set_input_output() {
         for (int node_n = 0; node_n < m_cgraph->n_nodes; node_n++) {
             cgraph_nodes.insert(m_cgraph->nodes[node_n]);
         }
-        std::set<const ggml_tensor *> injected;
         for (int node_n = 0; node_n < m_cgraph->n_nodes; node_n++) {
             auto * node = m_cgraph->nodes[node_n];
             for (int i = 0; i < GGML_MAX_SRC; i++) {
                 auto * src = node->src[i];
-                if (src == nullptr || src->op != GGML_OP_VIEW || src->view_src == nullptr) {
+                if (src == nullptr || src->op != GGML_OP_VIEW) {
                     continue;
                 }
-                if (cgraph_nodes.count(src) || injected.count(src)) {
+                if (cgraph_nodes.count(src) || injected_external_views.count(src)) {
                     continue;  // already a real node / already injected
                 }
                 const ggml_tensor * vsrc = src->view_src;
+                if (vsrc == nullptr) {
+                    continue;
+                }
                 if (cgraph_nodes.count(vsrc) || m_weight_names.count(std::string(vsrc->name))) {
                     continue;  // view_src is produced locally / is a weight -> normal handling
                 }
-                // Exclude KV-cache views (USAGE_ANY): those have dedicated PERMUTE/SET_ROWS handling.
-                if (vsrc->buffer && vsrc->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY) {
+                // Cache views consumed by stateful operations have dedicated handling. Ordinary
+                // backend inputs also use USAGE_ANY, so the buffer usage alone is not sufficient.
+                const bool dedicated_cache_view =
+                    vsrc->buffer && vsrc->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY &&
+                    (node->op == GGML_OP_PERMUTE || node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_CPY ||
+                     node->op == GGML_OP_SCALE || (node->op == GGML_OP_GET_ROWS && i == 0));
+                if (dedicated_cache_view) {
                     continue;
                 }
-                // qwen3-next recurrent-state slot reorder (inp->s_copy): a GET_ROWS that reorders a
-                // recurrent-state cache (src[0] lives in a USAGE_ANY buffer) indexes it with a VIEW of
-                // the s_copy leaf (src[1]). For the active-slot GET_ROWS that index VIEW happens to be a
-                // standalone cgraph node and is translated normally; for the reorder GET_ROWS it is
-                // anonymous (never a cgraph node), so without injection get_input(1) has nothing to
-                // resolve and the frontend throws. Inject it as a translated VIEW of the leaf, mirroring
-                // the standalone case, so both GET_ROWS resolve identically. This index VIEW is not a
-                // rank-reducing per-layer pick, so it bypasses the select-and-drop gate below.
-                const bool is_scopy_index = node->op == GGML_OP_GET_ROWS && i == 1 &&
-                                            node->src[0] != nullptr && node->src[0]->buffer != nullptr &&
-                                            node->src[0]->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY;
-                if (!is_scopy_index) {
-                    // Must be a rank-reducing select-and-drop of exactly one axis (a per-layer pick).
-                    if (src->type != vsrc->type || ggml_nelements(src) >= ggml_nelements(vsrc)) {
-                        continue;
-                    }
-                    bool select_and_drop = false;
-                    for (int d = 0; d < GGML_MAX_DIMS && !select_and_drop; ++d) {
-                        if (vsrc->ne[d] <= 1 || src->ne[d] != 1) {
-                            continue;
-                        }
-                        int64_t squeezed[GGML_MAX_DIMS];
-                        int p = 0;
-                        for (int e = 0; e < GGML_MAX_DIMS; ++e) {
-                            if (e != d) {
-                                squeezed[p++] = vsrc->ne[e];
-                            }
-                        }
-                        squeezed[p] = 1;
-                        bool match = true;
-                        for (int e = 0; e < GGML_MAX_DIMS; ++e) {
-                            if (src->ne[e] != squeezed[e]) {
-                                match = false;
-                                break;
-                            }
-                        }
-                        select_and_drop = match;
-                    }
-                    if (!select_and_drop) {
-                        continue;
-                    }
-                }
-                injected.insert(src);
+                injected_external_views.insert(src);
 
                 const std::string vsrc_name = unique_tensor_name(vsrc, std::string(vsrc->name));
                 const std::string view_name = unique_tensor_name(src, std::string(src->name));
@@ -501,7 +487,24 @@ void GgmlOvDecoder::set_input_output() {
                 continue;
             }
             std::string src_name;
-            if (src->flags & GGML_TENSOR_FLAG_INPUT) {
+            const bool recurrent_cpy_source =
+                i == 0 && node->op == GGML_OP_CPY && src->op == GGML_OP_VIEW && src->src[0] != nullptr &&
+                (is_conv_state_writeback(node) || src->src[0]->op == GGML_OP_GATED_DELTA_NET);
+            const bool recurrent_cpy_destination =
+                i == 1 && node->op == GGML_OP_CPY && src->op == GGML_OP_VIEW && src->view_src != nullptr &&
+                is_kvcache(src->view_src, nullptr);
+            const bool recurrent_scale_source =
+                i == 0 && node->op == GGML_OP_SCALE && node->view_src != nullptr &&
+                is_kvcache(node->view_src, nullptr);
+            if (recurrent_cpy_source) {
+                src_name = unique_tensor_name(src->src[0], std::string(src->src[0]->name));
+            } else if (recurrent_cpy_destination) {
+                src_name = unique_tensor_name(src->view_src, std::string(src->view_src->name));
+            } else if (recurrent_scale_source) {
+                src_name = unique_tensor_name(node->view_src, std::string(node->view_src->name));
+            } else if (injected_external_views.count(src)) {
+                src_name = unique_tensor_name(src, std::string(src->name));
+            } else if (src->flags & GGML_TENSOR_FLAG_INPUT) {
                 src_name = get_graph_input_ov_name(src, node);
             } else if (m_weight_names.count(std::string(src->name)) || is_rope_freqs_weight(src, node)) {
                 // Weights keep their canonical (shared) name.
@@ -597,11 +600,37 @@ int GgmlOvDecoder::compute_op_case(const ggml_tensor * node) const {
         break;
     }
     case GGML_OP_GET_ROWS: {
-        if (node->src[1]->op == GGML_OP_VIEW) {
+        if (node->src[0] != nullptr && node->src[0]->buffer != nullptr &&
+            node->src[0]->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY &&
+            strncmp(node->src[0]->name, "cache_", 6) == 0) {
+            op_case = ggml_nelements(node) == 0 ? 3 : 4;
+        } else if (node->src[1]->op == GGML_OP_VIEW) {
             op_case = 2;
         }
         break;
     }
+    case GGML_OP_CPY: {
+        if (node->src[0]->op == GGML_OP_VIEW) {
+            if (node->src[0]->src[0] != nullptr && node->src[0]->src[0]->op == GGML_OP_GATED_DELTA_NET) {
+                op_case = 1;
+            } else if (is_conv_state_writeback(node)) {
+                op_case = 2;
+            } else if (is_conv_states_all_tensor(node->view_src) && node->src[1] != nullptr &&
+                       node->src[1]->op == GGML_OP_VIEW && node->src[1]->view_src == node->view_src) {
+                op_case = 4;
+            }
+        } else if (node->src[0]->op == GGML_OP_GET_ROWS && node->src[1] != nullptr &&
+                   node->src[1]->op == GGML_OP_VIEW && node->src[1]->view_src != nullptr &&
+                   is_kvcache(node->src[1]->view_src, nullptr)) {
+            op_case = 3;
+        }
+        break;
+    }
+    case GGML_OP_SCALE:
+        if (node->view_src != nullptr && is_kvcache(node->view_src, nullptr)) {
+            op_case = 1;
+        }
+        break;
     case GGML_OP_ROPE: {
         const int mode = node->op_params[2];
         switch (mode) {
@@ -763,6 +792,21 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
     ComputeParams compute_params;
     bool seen_rope = false;
 
+    uint64_t shape_signature = 1469598103934665603ULL;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        shape_signature ^= static_cast<uint64_t>(node->op);
+        shape_signature *= 1099511628211ULL;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            shape_signature ^= static_cast<uint64_t>(node->ne[d]);
+            shape_signature *= 1099511628211ULL;
+        }
+        if (ggml_nelements(node) == 0) {
+            model_params.has_zero_sized_tensor = true;
+        }
+    }
+    model_params.graph_shape_signature = shape_signature;
+
     // Sliding-window-mask pre-scan over the WHOLE graph. It must run before the main loop, which
     // consults model_params.swa_mask to classify each attention node.
     //
@@ -906,22 +950,27 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
             compute_params.cache_rs_reset_len = (int) (ggml_nelements(node) / node->view_src->ne[0]);
             compute_params.cache_rs_reset_idx = (int) (node->src[0]->view_offs / node->view_src->ne[0]);
         }
-        // Active-slot block of the recurrent-state reorder (inp->s_copy): the active sequences occupy
-        // a contiguous slot block [idx, idx+len) of the state cache. Read idx/len from the active
-        // conv/gdn state writeback destination view (idx = head slot, len = active sequence count).
         if (node->op == GGML_OP_CPY && node->view_src != nullptr && is_kvcache(node->view_src, nullptr) &&
-            node->src[0] != nullptr && node->src[0]->op == GGML_OP_VIEW && node->src[1] != nullptr) {
-            const bool is_conv = std::string(node->src[0]->name).find("conv_state_last") == 0;
-            const bool is_gdn =
-                node->src[0]->src[0] != nullptr && node->src[0]->src[0]->op == GGML_OP_GATED_DELTA_NET;
-            if (is_conv || is_gdn) {
-                const ggml_tensor * dest_view = node->src[1];
-                const ggml_tensor * cache = node->view_src;
-                const size_t row_bytes = cache->ne[0] * ggml_type_size(cache->type);
-                if (row_bytes > 0) {
-                    compute_params.s_copy_active_slot_idx = (int) (dest_view->view_offs / row_bytes);
-                    compute_params.s_copy_active_slot_len = (int) dest_view->ne[1];
+            node->src[0] != nullptr && node->src[1] != nullptr && node->src[1]->op == GGML_OP_VIEW &&
+            node->src[1]->view_src == node->view_src) {
+            const bool is_conv = is_conv_state_writeback(node);
+            const bool is_gdn = node->src[0]->op == GGML_OP_VIEW && node->src[0]->src[0] != nullptr &&
+                                node->src[0]->src[0]->op == GGML_OP_GATED_DELTA_NET;
+            const bool is_extra = node->src[0]->op == GGML_OP_GET_ROWS;
+
+            const ggml_tensor * dest_view = node->src[1];
+            const ggml_tensor * cache = node->view_src;
+            const size_t row_bytes = cache->ne[0] * ggml_type_size(cache->type);
+            if (row_bytes > 0 && (is_conv || is_gdn || is_extra)) {
+                ComputeParams::RsWriteback writeback;
+                writeback.slot_begin = (int) (dest_view->view_offs / row_bytes);
+                if (is_conv) {
+                    writeback.src_begin = (int) (node->src[0]->view_offs / node->src[0]->view_src->nb[0]);
                 }
+                compute_params.rs_writebacks[recurrent_writeback_name(cgraph, node)] = writeback;
+            }
+            if (is_conv || is_gdn) {
+                compute_params.s_copy_active_slot_len = (int) dest_view->ne[1];
             }
         }
     }
@@ -981,7 +1030,9 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op, co
         // the OpenVINO stateful (ReadValue/Assign) form is done by the LlamaCppToStateful pass,
         // which only rewires the Parameter/Result into state vars without changing the layout.
         input_shape = ov::PartialShape{get_shape(input)};
-        if (!m_is_static) {
+        const bool recurrent_cache = strncmp(input->name, "cache_r_l", strlen("cache_r_l")) == 0 ||
+                                     strncmp(input->name, "cache_s_l", strlen("cache_s_l")) == 0;
+        if (!m_is_static && !recurrent_cache) {
             // do not fix ctx size to make llama-bench work across test params
             input_shape[2] = -1;
         }
@@ -1069,8 +1120,13 @@ void GgmlOvDecoder::add_extra_inputs() {
         create_1d_input("cache_rs_reset_len", m_compute_params.cache_rs_reset_len);
     }
     if (m_compute_params.s_copy_active_slot_len != -1) {
-        create_1d_input("s_copy_active_slot_idx", m_compute_params.s_copy_active_slot_idx);
         create_1d_input("s_copy_active_slot_len", m_compute_params.s_copy_active_slot_len);
+    }
+    for (const auto & [node_name, writeback] : m_compute_params.rs_writebacks) {
+        create_1d_input("rs_slot_begin_" + node_name, writeback.slot_begin);
+        if (writeback.src_begin != -1) {
+            create_1d_input("rs_src_begin_" + node_name, writeback.src_begin);
+        }
     }
 
     // Build the unified map returned by get_model_inputs() (primary + extra).
@@ -2019,6 +2075,23 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
         // GGML_OP_GATED_DELTA_NET stores K, the recurrent-state snapshot count, in op_params[0].
         return static_cast<int64_t>(ggml_get_op_params_i32(info.node, 0));
     }
+    if (name == "gdn_packed_width") {
+        const ggml_tensor * src = info.node->src[0];
+        if (src != nullptr && src->op == GGML_OP_VIEW) {
+            src = src->src[0];
+        }
+        if (src != nullptr && src->op == GGML_OP_GATED_DELTA_NET) {
+            return static_cast<int64_t>(src->ne[0]);
+        }
+        return static_cast<int64_t>(-1);
+    }
+    if (name == "rs_writeback_name") {
+        return recurrent_writeback_name(m_cgraph, info.node);
+    }
+    if (name == "cpy_output_offset_elems") {
+        const size_t elem_size = ggml_type_size(info.node->type);
+        return static_cast<int64_t>(elem_size == 0 ? 0 : info.node->view_offs / elem_size);
+    }
     if (name == "set_offset_elems") {
         // GGML_OP_SET writes src[1] into a contiguous region of src[0]'s flattened buffer. Its
         // op_params are { nb1, nb2, nb3, offset_bytes, inplace }; op_params[3] is the destination
@@ -2078,16 +2151,14 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
         // attn token rows. Use the GDN's second output view (new_state) shape: state rows = S_v.
         const int64_t packed_rows = gdn->ne[1];
         int64_t s_v = 0;
-        // state view: node->ne product / (S_v*H_v) gives S_v rows; simpler: state rows = packed_rows -
-        // attn_rows. attn_rows (T) = token count. We derive S_v directly from the GDN input state
-        // (src[5]) which is [S_v, S_v, H_v, 1]: its ne[0] is S_v.
-        const ggml_tensor * gdn_state_in = gdn->src[5];
-        if (gdn_state_in != nullptr) {
-            s_v = gdn_state_in->ne[0];
-        } else {
-            s_v = packed_rows;  // fallback (should not happen)
-        }
         const int64_t part = (byte_offset == 0) ? 0 : 1;
+        const int64_t packed_width = gdn->ne[0];
+        if (packed_width > 0) {
+            const int64_t view_rows = static_cast<int64_t>(ggml_nelements(node)) / packed_width;
+            s_v = part == 0 ? packed_rows - view_rows : view_rows;
+        } else {
+            s_v = packed_rows;
+        }
         return std::vector<int64_t>{part, s_v};
     }
     if (name == "view_slice") {
@@ -2213,6 +2284,26 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
         }
         return std::vector<int64_t>{};
     }
+    if (name == "view_offset_bytes") {
+        size_t byte_offset = 0;
+        std::memcpy(&byte_offset, info.node->op_params, sizeof(size_t));
+        return static_cast<int64_t>(byte_offset);
+    }
+    if (name == "view_input_strides") {
+        std::vector<int64_t> strides(GGML_MAX_DIMS);
+        const ggml_tensor * src = info.node->src[0];
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            strides[i] = static_cast<int64_t>(src->nb[i]);
+        }
+        return strides;
+    }
+    if (name == "view_output_strides") {
+        std::vector<int64_t> strides(GGML_MAX_DIMS);
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            strides[i] = static_cast<int64_t>(info.node->nb[i]);
+        }
+        return strides;
+    }
     if (name == "view_reshape") {
         // GGML_OP_VIEW op_case 3 target shape (OV dim order = ggml ne[] reversed). Only needed for
         // the select-and-drop case, where the Slice keeps a singleton on the collapsed source axis
@@ -2330,6 +2421,16 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
         return ggml_get_op_params_i32(info.node, 8) != 0;
     }
     if (name == "perm") {
+        if (info.node->op == GGML_OP_PERMUTE) {
+            std::vector<int64_t> perm(GGML_MAX_DIMS);
+            for (int ggml_in_axis = 0; ggml_in_axis < GGML_MAX_DIMS; ++ggml_in_axis) {
+                const int ggml_out_axis = ggml_get_op_params_i32(info.node, ggml_in_axis);
+                const int ov_out_axis = GGML_MAX_DIMS - 1 - ggml_out_axis;
+                perm[ov_out_axis] = GGML_MAX_DIMS - 1 - ggml_in_axis;
+            }
+            return perm;
+        }
+
         // GGML_OP_TRANSPOSE: permutation order derived from input/output strides, in OV dim order.
         // Rank input/output dims by descending stride and map matched ranks to build the perm.
         std::vector<size_t> in_stride = get_stride(info.node->src[0]);

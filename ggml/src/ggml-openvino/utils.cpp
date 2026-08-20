@@ -721,21 +721,20 @@ enum ggml_status naive_compute(ggml_cgraph * cgraph,
         infer_request->set_input_tensor(i, input_tensor);
     }
 
+    infer_request->infer();
+
+    // A single view-like op can have overlapping input/output storage. Let OpenVINO allocate its
+    // output, then copy it after inference so the input is not overwritten while it is still read.
     auto ov_results = model->get_results();
     for (size_t i = 0; i < ov_results.size(); i++) {
         auto * ggml_tensor = decoder->get_model_outputs().at(ov_results[i]->get_friendly_name());
-        // A 0-element ggml output (e.g. a qwen3-next recurrent-state reorder write with 0 active
-        // sequences) has nothing to receive, yet its OV Result port can be statically size 1. Binding
-        // a size-0 tensor to a size-1 port makes set_output_tensor throw. Skip the bind; OV keeps its
-        // own (unused) output buffer, which matches ggml's no-op semantics for the empty write.
         if (ggml_nelements(ggml_tensor) == 0) {
             continue;
         }
-        auto output_tensor = create_ov_output_tensor(decoder, infer_request, i, ggml_tensor);
-        infer_request->set_output_tensor(i, output_tensor);
+        auto output_tensor = infer_request->get_output_tensor(i);
+        const size_t copy_size = std::min(ggml_nbytes(ggml_tensor), output_tensor.get_byte_size());
+        std::memcpy(ggml_tensor->data, output_tensor.data(), copy_size);
     }
-
-    infer_request->infer();
     return GGML_STATUS_SUCCESS;
 }
 

@@ -35,6 +35,8 @@ struct ModelParams {
     // use different n_dims / freq_base). The frontend maps this to RopeConfig::per_op so each ROPE
     // op builds its own sin/cos instead of sharing a single precomputed table.
     bool mixed_rope_params = false;
+    bool has_zero_sized_tensor = false;
+    uint64_t graph_shape_signature = 0;
     std::vector<int> swa_layers;
     // The sliding-window attention mask tensor, when this graph is an iSWA model (gemma3/gemma4).
     // llama.cpp builds both masks through one shared build_attn_inp_kq_mask helper, so both are
@@ -55,7 +57,10 @@ struct ModelParams {
         return memcmp(rope_params, other.rope_params, sizeof(int32_t) * 15) == 0;
     }
 
-    bool can_reuse_dynamically(const ModelParams & other) const { return same_rope_params(other); }
+    bool can_reuse_dynamically(const ModelParams & other) const {
+        return same_rope_params(other) && has_zero_sized_tensor == other.has_zero_sized_tensor &&
+               graph_shape_signature == other.graph_shape_signature;
+    }
 
     bool can_reuse_statically(const ModelParams & other) const { return same_rope_params(other) && ctx == other.ctx; }
 
@@ -80,11 +85,14 @@ struct ComputeParams {
     int cache_rs_reset_idx = -1;
     int cache_rs_reset_len = -1;
 
-    // s_copy_active_slot_idx/_len: the active sequences occupy a contiguous slot block
-    // [idx, idx+len) of the state cache; the graph reorders slots (inp->s_copy) so the active
-    // ones are contiguous. Read from the active conv/gdn state writeback destination view.
-    int s_copy_active_slot_idx = -1;
     int s_copy_active_slot_len = -1;
+
+    struct RsWriteback {
+        int slot_begin = 0;
+        int src_begin = -1;
+    };
+
+    std::map<std::string, RsWriteback> rs_writebacks;
 };
 
 class GgmlOvDecoder : public ov::frontend::gguf::GgufDecoder {

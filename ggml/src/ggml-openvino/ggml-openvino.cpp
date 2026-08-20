@@ -627,14 +627,11 @@ static ggml_guid_t ggml_backend_openvino_guid(void) {
     return &guid;
 }
 
-static std::shared_ptr<ov_runtime_context> get_ov_runtime_context_ptr() {
-    static std::shared_ptr<ov_runtime_context> r_ctx = [] {
-        auto ctx = std::make_shared<ov_runtime_context>();
-        ctx->device = ggml_openvino_get_device_name();
-        ctx->stateful = is_stateful_enabled() && !ggml_openvino_is_npu();
-        return ctx;
-    }();
-    return r_ctx;
+static std::shared_ptr<ov_runtime_context> make_ov_runtime_context_ptr() {
+    auto ctx = std::make_shared<ov_runtime_context>();
+    ctx->device = ggml_openvino_get_device_name();
+    ctx->stateful = is_stateful_enabled() && !ggml_openvino_is_npu();
+    return ctx;
 }
 
 // backend API
@@ -650,7 +647,9 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_openvino_init(int device) {
         return nullptr;
     }
 
-    ctx->runtime_context = get_ov_runtime_context_ptr();
+    // Infer requests contain mutable tensor bindings and stateful KV state. They must not be
+    // shared by independent llama contexts, so each backend instance owns its runtime cache.
+    ctx->runtime_context = make_ov_runtime_context_ptr();
     if (ctx->runtime_context == nullptr) {
         GGML_LOG_ERROR("%s: failed to allocate runtime context\n", __func__);
         delete ctx;
@@ -756,6 +755,15 @@ static bool has_view_op_input(const ggml_tensor * op) {
     return false;
 }
 
+static bool has_non_contiguous_view_input(const ggml_tensor * op) {
+    for (int i = 0; i < GGML_MAX_SRC && op->src[i] != nullptr; ++i) {
+        if (op->src[i]->op == GGML_OP_VIEW && !ggml_is_contiguous(op->src[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool is_supported_flash_attn_pattern(const ggml_tensor * op) {
     // pattern of q,k,v should be q->op==PERMUTE, q->src[0]->op==VIEW, q->src[0]->src[0]->view_src==nullptr
     for (int i = 0; i < 3; i++) {
@@ -796,8 +804,47 @@ static bool cpy_output_view_is_supported(const ggml_tensor * op) {
     return ggml_nbytes(op) == 0 || ggml_is_contiguous(op);
 }
 
+static bool checked_mul_size(size_t a, size_t b, size_t & out) {
+    if (a == 0 || b == 0) {
+        out = 0;
+        return true;
+    }
+    if (a > SIZE_MAX / b) {
+        return false;
+    }
+    out = a * b;
+    return true;
+}
+
+static bool mul_mat_id_requires_large_tmp(const ggml_tensor * op) {
+    const ggml_tensor * as = op->src[0];
+    const ggml_tensor * ids = op->src[2];
+    if (as == nullptr || ids == nullptr) {
+        return true;
+    }
+
+    size_t tmp_elems = 1;
+    if (!checked_mul_size(tmp_elems, static_cast<size_t>(ids->ne[1]), tmp_elems) ||
+        !checked_mul_size(tmp_elems, static_cast<size_t>(ids->ne[0]), tmp_elems) ||
+        !checked_mul_size(tmp_elems, static_cast<size_t>(as->ne[1]), tmp_elems) ||
+        !checked_mul_size(tmp_elems, static_cast<size_t>(as->ne[0]), tmp_elems)) {
+        return true;
+    }
+
+    size_t tmp_bytes = 0;
+    return !checked_mul_size(tmp_elems, sizeof(float), tmp_bytes) || tmp_bytes > (1ULL << 30);
+}
+
 static bool is_op_unsupported_case(const ggml_tensor * op) {
     switch (op->op) {
+    case GGML_OP_CONCAT:
+        return op->type == GGML_TYPE_I64;
+    case GGML_OP_VIEW: {
+        if (strcmp(op->name, "selected_experts") == 0) {
+            return true;
+        }
+        break;
+    }
     case GGML_OP_GET_ROWS:
     case GGML_OP_SET_ROWS: {
         if (op->ne[3] != 1) {
@@ -807,7 +854,7 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
     }
     case GGML_OP_ADD:
     case GGML_OP_MUL:
-    case GGML_OP_DIV: {
+    case GGML_OP_SUB: {
         if (op->src[1]->op == GGML_OP_PERMUTE) {
             return true;
         }
@@ -818,18 +865,26 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         }
         break;
     }
+    case GGML_OP_ADD_ID:
+        return op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
+               op->src[1]->type != GGML_TYPE_F32 || op->src[2]->type != GGML_TYPE_I32;
+    case GGML_OP_DIV: {
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (op->src[0]->ne[i] != op->src[1]->ne[i] && op->src[0]->ne[i] != 1 &&
+                op->src[1]->ne[i] != 1) {
+                return true;
+            }
+        }
+        break;
+    }
     case GGML_OP_SOFT_MAX: {
-        float scale = 1.0f;
-        float max_bias = 0.0f;
-        const auto * op_params = op->op_params;
-        memcpy(&scale, (const float *) op_params + 0, sizeof(float));
-        memcpy(&max_bias, (const float *) op_params + 1, sizeof(float));
-        if (max_bias > 0) {
-            // GGML_LOG_WARN("OpenVINO backend does not support SOFT_MAX with max_bias > 0\n");
+        if (op->src[2] != nullptr) {
             return true;
         }
         break;
     }
+    case GGML_OP_SUM_ROWS:
+        return op->src[0]->op == GGML_OP_PERMUTE;
     case GGML_OP_FLASH_ATTN_EXT: {
         if (op->src[4] != nullptr) {
             // GGML_LOG_WARN("OpenVINO backend does not support FLASH_ATTN_EXT with sinks\n");
@@ -911,20 +966,7 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         break;
     }
     case GGML_OP_MUL_MAT: {
-        if (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16) {
-            // Has accuracy issue, try enabling this and see `test-backend-ops -o "MUL_MAT"`
-            // GGML_LOG_WARN("OpenVINO backend does not support MUL_MAT with two F16 tensors\n");
-            return true;
-        }
         if (op->src[0]->ne[3] != op->src[1]->ne[3] && op->src[0]->ne[3] != 1 && op->src[1]->ne[3] != 1) {
-            return true;
-        }
-        if (op->src[0]->op == GGML_OP_PERMUTE || op->src[1]->op == GGML_OP_PERMUTE) {
-            return true;
-        }
-        if (ggml_is_quantized(op->src[0]->type) && op->src[0]->ne[1] == 1) {
-            // MUL_MAT(type_a=q4_0,type_b=f32,m=1,n=2048,k=8192,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1)
-            // triggers a bug in ov matmul_shape_inference.hpp
             return true;
         }
         if (op->src[0]->op == GGML_OP_VIEW && op->src[1]->op == GGML_OP_VIEW) {
@@ -932,6 +974,8 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         }
         break;
     }
+    case GGML_OP_MUL_MAT_ID:
+        return mul_mat_id_requires_large_tmp(op);
     case GGML_OP_ROPE: {
         const int32_t * op_params = op->op_params;
         const int n_dims = op_params[1];
@@ -949,7 +993,7 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
             //               op->src[0]->ne[0]);
             return true;
         }
-        if (op->type != GGML_TYPE_F32) {
+        if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) {
             // GGML_LOG_WARN("OpenVINO backend does not support ROPE with type %s\n", ggml_type_name(op->type));
             return true;
         }
@@ -970,6 +1014,8 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         }
         break;
     }
+    case GGML_OP_TRANSPOSE:
+        return op->type == GGML_TYPE_BF16;
     default:
         break;
     }
@@ -1053,7 +1099,7 @@ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, con
         if (!supported) {
             return false;
         }
-        if (has_view_op_input(op)) {
+        if (ggml_get_unary_op(op) == GGML_UNARY_OP_EXP && op->type == GGML_TYPE_F32) {
             return false;
         }
         break;
@@ -1080,13 +1126,11 @@ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, con
         if (!supported) {
             return false;
         }
-        // The OpenVINO gguf frontend resolves VIEW inputs into real Slice/Reshape nodes
-        // (translate_view), so ops read their inputs already-resolved via context.get_input(). No op
-        // needs to be forced onto CPU purely for having a view input; keeping any op here would split
-        // the graph at a strided-view boundary (e.g. GET_ROWS of a MoE topk view, or qwen3-next's
-        // norm reading a token-embedding view) that the OV path can in fact feed.
-        static const std::set<ggml_op> ops_not_support_view_input{};
+        static const std::set<ggml_op> ops_not_support_view_input{GGML_OP_L2_NORM};
         if (ops_not_support_view_input.find(op->op) != ops_not_support_view_input.end() && has_view_op_input(op)) {
+            return false;
+        }
+        if (op->op == GGML_OP_RMS_NORM && has_non_contiguous_view_input(op)) {
             return false;
         }
     }
@@ -1103,7 +1147,7 @@ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, con
         if (supported_types.find(src->type) == supported_types.end()) {
             return false;
         }
-        if (ggml_is_quantized(src->type) && src->ne[2] != 1 && op->op != GGML_OP_MUL_MAT_ID) {
+        if (ggml_is_quantized(src->type) && src->ne[2] != 1) {
             return false;
         }
     }

@@ -1256,6 +1256,14 @@ void GgmlOvDecoder::compute_model_inputs() {
 void GgmlOvDecoder::compute_model_outputs() {
     m_model_outputs.clear();
     m_model_output_names.clear();
+    // Multiple in-place writebacks to the same recurrent-state cache (e.g. several disjoint
+    // rollback windows written back within one cgraph) all redirect to the same view_src, so they
+    // resolve to the same output name below. Track which names already got a Result so each name
+    // is only listed once: translate_session.cpp's tensor_map is name-keyed too, so a name listed
+    // more than once would just create redundant Results for the identical (last-write) Output
+    // anyway, and OpenVINO auto-disambiguates duplicate Result friendly names, desyncing them from
+    // the names this decoder reports through get_model_output_names()/get_model_outputs().
+    std::set<std::string> seen_output_names;
     for (int node_n = 0; node_n < m_cgraph->n_nodes; node_n++) {
         auto * cur_node = m_cgraph->nodes[node_n];
         // if the node op is NONE means this node is not used at all, we can skip it directly without adding to model outputs.
@@ -1288,7 +1296,9 @@ void GgmlOvDecoder::compute_model_outputs() {
             auto un = m_tensor_unique_name.find(cur_node);
             std::string node_output_name = (un != m_tensor_unique_name.end()) ? un->second : std::string(cur_node->name);
             m_model_outputs[node_output_name] = cur_node;
-            m_model_output_names.push_back(node_output_name);
+            if (seen_output_names.insert(node_output_name).second) {
+                m_model_output_names.push_back(node_output_name);
+            }
         }
     }
 

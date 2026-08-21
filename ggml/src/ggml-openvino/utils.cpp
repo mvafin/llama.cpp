@@ -324,12 +324,26 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
 
             std::vector<std::string> ov_input_names;
             std::vector<std::string> ov_output_names;
-            for (const auto & ov_param : model->get_parameters()) {
-                ov_input_names.push_back(ov_param->get_friendly_name());
+            // Derive input names from the actual compiled model, not the pre-compilation `model`:
+            // a plugin transformation can drop a Parameter that becomes disconnected during its
+            // own internal optimization (e.g. GatedDeltaNetFusion removing now-unused
+            // recurrent-state bookkeeping inputs), which core.compile_model() applies to its own
+            // clone without touching `model`. Binding tensors by index below must match the
+            // compiled model's actual input count and order.
+            for (const auto & ov_input : compiled_model.inputs()) {
+                ov_input_names.push_back(ov_input.get_node()->get_friendly_name());
             }
-            for (const auto & ov_output : model->get_results()) {
-                ov_output_names.push_back(ov_output->get_friendly_name());
-            }
+            // Outputs, unlike inputs, are never dropped by a plugin transformation (doing so would
+            // trip the same input/output port-count invariant that rules out dropping a
+            // Parameter), so compiled_model.outputs() always has one entry per Result in the same
+            // order translate_session.cpp built them: from get_model_output_names(). Use that list
+            // directly instead of compiled_model.outputs()'s friendly names -- when a
+            // recurrent-state cache is both a Parameter and a Result (read the previous state,
+            // write the new one back under the same conceptual name), OpenVINO auto-disambiguates
+            // the Result's friendly name to avoid the Parameter/Result name clash (e.g. "cache_r_l0"
+            // -> "cache_r_l0_1"), which would otherwise fail to look up in
+            // ggml_decoder->get_model_outputs() below.
+            ov_output_names = ggml_decoder->get_model_output_names();
 
             {
                 std::lock_guard<std::mutex> map_lock(r_ctx->ctx_mutex);
@@ -560,12 +574,13 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, std::shared_ptr<o
 
         std::vector<std::string> ov_input_names;
         std::vector<std::string> ov_output_names;
-        for (const auto & ov_param : model->get_parameters()) {
-            ov_input_names.push_back(ov_param->get_friendly_name());
+        // See the single-model compile path above for why inputs are read from the compiled
+        // model's actual ports, and outputs from the decoder's own get_model_output_names().
+        const auto & compiled_model = is_prefill ? compiled_model_prefill : compiled_model_decode;
+        for (const auto & ov_input : compiled_model.inputs()) {
+            ov_input_names.push_back(ov_input.get_node()->get_friendly_name());
         }
-        for (const auto & ov_output : model->get_results()) {
-            ov_output_names.push_back(ov_output->get_friendly_name());
-        }
+        ov_output_names = ggml_decoder->get_model_output_names();
 
         {
             std::lock_guard<std::mutex> map_lock(r_ctx->ctx_mutex);

@@ -72,6 +72,7 @@ struct ComputeParams {
     int seq_active_start = 0;
     int attention_size = -1;
     int attention_size_swa = -1;
+    int attention_size_static = -1;  // encoder/cross-attention KV length (Whisper)
     int input_len = -1;
     int token_len_per_seq = -1;
     int past_kv_len = -1;
@@ -234,6 +235,10 @@ public:
 
     inline static bool is_inp_pos(const ggml_tensor * tensor, const ggml_tensor * op) {
         return op->op == GGML_OP_ROPE && tensor == op->src[1];
+    }
+
+    inline static int get_inp_pos_n_planes(const ggml_tensor * op) {
+        return op->op_params[2] == GGML_ROPE_TYPE_IMROPE ? 4 : 1;
     }
 
     inline static bool is_inp_emb(const ggml_tensor * tensor, const ggml_tensor * op) {

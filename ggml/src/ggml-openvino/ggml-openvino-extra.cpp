@@ -22,7 +22,39 @@ void ggml_openvino_device_config::init() {
     if (initialized) {
         return;
     }
-    device_name = getenv("GGML_OPENVINO_DEVICE") ? getenv("GGML_OPENVINO_DEVICE") : "CPU";
+    static constexpr const char * env_var_names[] = {
+        "GGML_OPENVINO_DEVICE",
+        "GGML_OPENVINO_CACHE_DIR",
+        "GGML_OPENVINO_DEBUG_NODE",
+        "GGML_OPENVINO_COMPILED_MODEL_CACHE_DIR",
+        "GGML_OPENVINO_NPU_COMPILE_CONFIG",
+        "GGML_OPENVINO_PREFILL_CHUNK_SIZE",
+        "GGML_OPENVINO_STATEFUL_EXECUTION",
+        "GGML_OPENVINO_PROFILING",
+        "GGML_OPENVINO_DUMP_CGRAPH",
+        "GGML_OPENVINO_DUMP_IR",
+        "GGML_OPENVINO_DEBUG_INPUT",
+        "GGML_OPENVINO_DEBUG_OUTPUT",
+        "GGML_OPENVINO_FORCE_STATIC",
+        "GGML_OPENVINO_FORCE_F32",
+        "GGML_OPENVINO_PRINT_CGRAPH_TENSOR_ADDRESS",
+        "GGML_OPENVINO_ENABLE_CACHE",
+        "GGML_OPENVINO_DISABLE_CACHE",
+        "GGML_OPENVINO_DISABLE_KV_SLICE",
+        "GGML_OPENVINO_ENABLE_FALLBACK",
+        "GGML_OPENVINO_MANUAL_GQA_ATTN",
+        "GGML_OPENVINO_MEMORY_OPTIMIZE",
+        "GGML_OPENVINO_RELEASE_WEIGHTS",
+        "GGML_OPENVINO_REDUCE_COMPILE_MEM",
+        "GGML_OPENVINO_LOG_UNSUPPORTED_OPS",
+    };
+    for (const char * env_var : env_var_names) {
+        if (const char * value = getenv(env_var)) {
+            environment_variables[env_var] = value;
+        }
+    }
+
+    device_name = ggml_openvino_getenv_str("GGML_OPENVINO_DEVICE", "CPU");
     auto available_devices = ov_singleton_core().get_available_devices();
     if (std::find(available_devices.begin(), available_devices.end(), device_name) == available_devices.end()) {
         GGML_LOG_WARN("GGML OpenVINO Backend: device %s is not available, fallback to CPU\n", device_name.c_str());
@@ -30,7 +62,7 @@ void ggml_openvino_device_config::init() {
     }
     is_npu = (device_name == "NPU");
 
-    auto * cache_dir = getenv("GGML_OPENVINO_CACHE_DIR");
+    const char * cache_dir = ggml_openvino_getenv_str("GGML_OPENVINO_CACHE_DIR");
     if (device_name == "NPU") {
         compile_config = {
             {"NPU_COMPILER_DYNAMIC_QUANTIZATION", "YES"   },
@@ -47,6 +79,10 @@ void ggml_openvino_device_config::init() {
             compile_config["NPUW_CACHE_DIR"] = cache_dir;
             compile_config.insert(ov::cache_mode(ov::CacheMode::OPTIMIZE_SIZE));
         }
+        const char * compilation_mode_params = ggml_openvino_getenv_str("GGML_OPENVINO_NPU_COMPILE_CONFIG");
+        if (compilation_mode_params && strlen(compilation_mode_params) > 0) {
+            compile_config["NPU_COMPILATION_MODE_PARAMS"] = compilation_mode_params;
+        }
     } else if (cache_dir && strlen(cache_dir) > 0) {
         compile_config.insert(ov::cache_dir(cache_dir));
         compile_config.insert(ov::cache_mode(ov::CacheMode::OPTIMIZE_SIZE));
@@ -55,7 +91,7 @@ void ggml_openvino_device_config::init() {
     // DEBUG: GGML_OPENVINO_FORCE_F32 pins the plugin to full f32 inference precision (ACCURACY mode),
     // disabling the CPU plugin's default bf16 downconvert. Used to test whether an accuracy regression
     // is bf16 rounding accumulation. See src/frontends/gguf/docs/debugging_accuracy.md.
-    if (getenv("GGML_OPENVINO_FORCE_F32")) {
+    if (ggml_openvino_getenv_int("GGML_OPENVINO_FORCE_F32")) {
         compile_config[ov::hint::inference_precision.name()] = ov::element::f32;
         compile_config[ov::hint::execution_mode.name()] = ov::hint::ExecutionMode::ACCURACY;
     }
@@ -125,6 +161,31 @@ void ggml_openvino_init_device_config() {
 // Get the device name
 const std::string & ggml_openvino_get_device_name() {
     return ggml_openvino_get_device_config().device_name;
+}
+
+const char * ggml_openvino_getenv_str(const char * var, const char * default_value) {
+    auto & environment = ggml_openvino_get_device_config().environment_variables;
+    const auto it = environment.find(var);
+    return it == environment.end() || it->second.empty() ? default_value : it->second.c_str();
+}
+
+int ggml_openvino_getenv_int(const char * var, int default_value) {
+    const char * value = ggml_openvino_getenv_str(var);
+    return value ? std::atoi(value) : default_value;
+}
+
+bool ggml_openvino_reduce_compile_mem_enabled() {
+    if (ggml_openvino_getenv_str("GGML_OPENVINO_REDUCE_COMPILE_MEM")) {
+        return ggml_openvino_getenv_int("GGML_OPENVINO_REDUCE_COMPILE_MEM") != 0;
+    }
+    return ggml_openvino_getenv_int("GGML_OPENVINO_MEMORY_OPTIMIZE") != 0;
+}
+
+bool ggml_openvino_release_weights_enabled(const std::string & device) {
+    if (ggml_openvino_getenv_str("GGML_OPENVINO_RELEASE_WEIGHTS")) {
+        return device == "GPU" && ggml_openvino_getenv_int("GGML_OPENVINO_RELEASE_WEIGHTS") != 0;
+    }
+    return device == "GPU" && ggml_openvino_getenv_int("GGML_OPENVINO_MEMORY_OPTIMIZE") != 0;
 }
 
 // Check if running on NPU

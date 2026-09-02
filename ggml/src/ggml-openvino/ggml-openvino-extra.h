@@ -13,6 +13,7 @@
 #include <openvino/runtime/tensor.hpp>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 // ExtraQuantType enum - defines requantization target formats
 enum class ExtraQuantType { F16, Q4_0_C, Q8_1_C, Q4_0_128, Q8_0_C, Q8_0_32 };
@@ -64,6 +65,7 @@ struct ggml_openvino_device_config {
     bool initialized = false;
     std::optional<ov::RemoteContext> remote_context;
     ov::AnyMap compile_config;
+    std::unordered_map<std::string, std::string> environment_variables;
     cl_command_queue cl_queue = nullptr;
 
     void init();
@@ -78,6 +80,16 @@ void ggml_openvino_init_device_config();
 
 // Get the device name
 const std::string & ggml_openvino_get_device_name();
+
+const char * ggml_openvino_getenv_str(const char * var, const char * default_value = nullptr);
+int ggml_openvino_getenv_int(const char * var, int default_value = 0);
+
+bool ggml_openvino_reduce_compile_mem_enabled();
+bool ggml_openvino_release_weights_enabled(const std::string & device);
+
+void ggml_openvino_register_weight_buffer(void * data, size_t size);
+void ggml_openvino_release_weight_buffers();
+bool ggml_openvino_weight_buffers_released();
 
 // Check if running on NPU
 bool ggml_openvino_is_npu();

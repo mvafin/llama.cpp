@@ -1,7 +1,7 @@
-find_package(OpenVINO REQUIRED)
+find_package(OpenVINO REQUIRED COMPONENTS Runtime Threading)
 find_package(OpenCL REQUIRED)
 
-include("${OpenVINO_DIR}/../3rdparty/tbb/lib/cmake/TBB/TBBConfig.cmake")
+message(STATUS "Found OpenVINO: ${OpenVINO_DIR} (found version \"${OpenVINO_VERSION}\")")
 
 file(GLOB_RECURSE GGML_HEADERS_OPENVINO "*.h" "*.hpp")
 file(GLOB_RECURSE GGML_SOURCES_OPENVINO "*.cpp")
@@ -15,7 +15,7 @@ ggml_add_backend_library(ggml-openvino
 # alongside the runtime and exported via find_package(OpenVINO). It is hidden from
 # FrontEndManager, so it is used only through this direct linkage.
 target_link_libraries(ggml-openvino PRIVATE
-    openvino::runtime openvino::frontend::gguf TBB::tbb OpenCL::OpenCL)
+    openvino::runtime openvino::threading openvino::frontend::gguf OpenCL::OpenCL)
 
 if (GGML_OPENVINO)
     if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")

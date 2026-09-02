@@ -172,6 +172,22 @@ bool LlamaCppToStateful::run_on_model(const std::shared_ptr<ov::Model>& model) {
         for (auto target : set_rows->output(0).get_target_inputs()) {
             target.replace_source_output(concat);
         }
+        // The stateless cache has a fixed ctx_per_seq, so its relayout Reshape may contain a
+        // captured sequence extent (Falcon: [1,256,2,128]). The append-grown state is only as long
+        // as the tokens seen so far; preserve that runtime length with -1 after replacing the
+        // SetRows input, including the initial zero-length state.
+        const auto relayout_shape = chain.relayout->get_output_partial_shape(0);
+        if (relayout_shape.rank().is_static() && relayout_shape.rank().get_length() == 4 &&
+            relayout_shape[0].is_static() && relayout_shape[2].is_static() && relayout_shape[3].is_static()) {
+            auto dynamic_relayout = ov::op::v0::Constant::create(
+                ov::element::i64,
+                {4},
+                std::vector<int64_t>{relayout_shape[0].get_length(),
+                                     -1,
+                                     relayout_shape[2].get_length(),
+                                     relayout_shape[3].get_length()});
+            chain.relayout->input(1).replace_source_output(dynamic_relayout);
+        }
         // Bypass the stateless read windowing: feed the relayout Reshape (which produces the split
         // [1, seq, H, D] layout the read Transpose expects) directly into the Transpose, dropping
         // the attention_size/seq_active Slices. This yields the ReadValue->Concat->Reshape->

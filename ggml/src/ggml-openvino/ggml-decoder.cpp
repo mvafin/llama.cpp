@@ -261,6 +261,14 @@ InterleavedWindow detect_view_interleaved_window(const ggml_tensor * node) {
     w.inner_len = inner_len;
     return w;
 }
+
+bool is_flat_kv_view(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->op != GGML_OP_VIEW || tensor->view_src == nullptr) {
+        return false;
+    }
+    const ggml_tensor * base = tensor->view_src;
+    return base->ne[1] == 1 && base->ne[2] == 1 && base->ne[3] == 1;
+}
 }  // namespace
 
 GgmlOvDecoder::GgmlOvDecoder(ggml_cgraph * cgraph,
@@ -433,7 +441,8 @@ void GgmlOvDecoder::set_input_output() {
                 const bool dedicated_cache_view =
                     vsrc->buffer && vsrc->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY &&
                     (node->op == GGML_OP_PERMUTE || node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_CPY ||
-                     node->op == GGML_OP_SCALE || (node->op == GGML_OP_GET_ROWS && i == 0));
+                     node->op == GGML_OP_SCALE || (node->op == GGML_OP_GET_ROWS && i == 0) ||
+                     (node->op == GGML_OP_FLASH_ATTN_EXT && is_flat_kv_view(src)));
                 if (dedicated_cache_view) {
                     continue;
                 }
@@ -502,6 +511,11 @@ void GgmlOvDecoder::set_input_output() {
                 src_name = unique_tensor_name(src->view_src, std::string(src->view_src->name));
             } else if (recurrent_scale_source) {
                 src_name = unique_tensor_name(node->view_src, std::string(node->view_src->name));
+            } else if (node->op == GGML_OP_FLASH_ATTN_EXT && is_flat_kv_view(src)) {
+                // Whisper exposes K/V as direct 3-D views of a flat cache allocation. Pass the
+                // allocation itself to the frontend and retain the VIEW tensor in node_inputs so
+                // typed attributes can describe its offset and logical head geometry.
+                src_name = unique_tensor_name(src->view_src, std::string(src->view_src->name));
             } else if (injected_external_views.count(src)) {
                 src_name = unique_tensor_name(src, std::string(src->name));
             } else if (src->flags & GGML_TENSOR_FLAG_INPUT) {
@@ -570,6 +584,15 @@ int GgmlOvDecoder::compute_op_case(const ggml_tensor * node) const {
             op_case = 2;
         } else if (node->src[0]->op == GGML_OP_VIEW) {
             op_case = 3;
+        }
+        break;
+    }
+    case GGML_OP_POOL_2D: {
+        const auto mode = static_cast<ggml_op_pool>(ggml_get_op_params_i32(node, 0));
+        if (mode == GGML_OP_POOL_MAX) {
+            op_case = 1;
+        } else if (mode == GGML_OP_POOL_AVG) {
+            op_case = 2;
         }
         break;
     }
@@ -740,6 +763,11 @@ int GgmlOvDecoder::compute_op_case(const ggml_tensor * node) const {
         }
         break;
     }
+    case GGML_OP_FLASH_ATTN_EXT:
+        if (is_flat_kv_view(node->src[1]) && is_flat_kv_view(node->src[2])) {
+            op_case = node->src[3] != nullptr ? 1 : 2;
+        }
+        break;
     default:
         break;
     }
@@ -880,6 +908,20 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
         auto * node = cgraph->nodes[i];
         std::string name = std::string(node->name);
         if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            if (is_flat_kv_view(node->src[1]) && is_flat_kv_view(node->src[2])) {
+                // Whisper keeps each K/V cache in one flat allocation and passes a logical
+                // [head_size, length, heads] VIEW directly to attention. Decoder self-attention
+                // has a runtime mask; encoder/cross-attention has a separately tracked fixed fill
+                // length and no mask.
+                compute_params.input_len = node->src[0]->ne[1];
+                compute_params.token_len_per_seq = node->src[0]->ne[1];
+                if (node->src[3] != nullptr) {
+                    compute_params.attention_size = node->src[1]->ne[1];
+                } else {
+                    compute_params.attention_size_static = node->src[1]->ne[1];
+                }
+                continue;
+            }
             auto * cache_k_view = attn_kvcache_view(node);
             auto * mask = node->src[3];
             if (cache_k_view == nullptr || mask == nullptr) {
@@ -941,6 +983,10 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
         if (node->op == GGML_OP_GATED_DELTA_NET) {
             // Recurrent-state row width, used by the frontend to slice the packed [attn|new_state].
             model_params.state_size = node->src[0]->ne[0];
+            if (compute_params.input_len == -1) {
+                compute_params.input_len = node->src[0]->ne[2];
+                compute_params.token_len_per_seq = node->src[0]->ne[2];
+            }
         }
         // In-place SCALE-by-0 that clears a slot block [idx, idx+len) of the recurrent-state cache on
         // sequence reset. When absent (normal decode) the slot is preserved; we emit idx/len as graph
@@ -1076,8 +1122,8 @@ void GgmlOvDecoder::add_extra_inputs() {
     //     see llama_kv_cache_unified::get_n_kv and llama_kv_cache_unified::get_padding.
     // 2. `n_seq_active` and `seq_active_start`, used in FLASH_ATTN_EXT to indicate the active sequences in the batch
 
-    auto create_1d_input = [this](const std::string & name, int64_t value) {
-        if (m_is_static) {
+    auto create_1d_input = [this](const std::string & name, int64_t value, bool force_parameter = false) {
+        if (m_is_static && !force_parameter) {
             auto constant =
                 std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{value});
             constant->set_friendly_name(name);
@@ -1101,6 +1147,9 @@ void GgmlOvDecoder::add_extra_inputs() {
     if (m_compute_params.attention_size != -1) {
         create_1d_input("attention_size", m_compute_params.attention_size);
     }
+    if (m_compute_params.attention_size_static != -1) {
+        create_1d_input("attention_size_static", m_compute_params.attention_size_static);
+    }
     if (m_compute_params.attention_size_swa != -1) {
         create_1d_input("attention_size_swa", m_compute_params.attention_size_swa);
     }
@@ -1116,11 +1165,14 @@ void GgmlOvDecoder::add_extra_inputs() {
     // surfaced when the graph actually carries recurrent state (values != -1), so non-recurrent
     // models are unaffected.
     if (m_compute_params.cache_rs_reset_idx != -1) {
-        create_1d_input("cache_rs_reset_idx", m_compute_params.cache_rs_reset_idx);
-        create_1d_input("cache_rs_reset_len", m_compute_params.cache_rs_reset_len);
+        create_1d_input("cache_rs_reset_idx", m_compute_params.cache_rs_reset_idx, m_is_static);
+        create_1d_input("cache_rs_reset_len", m_compute_params.cache_rs_reset_len, m_is_static);
     }
     if (m_compute_params.s_copy_active_slot_len != -1) {
         create_1d_input("s_copy_active_slot_len", m_compute_params.s_copy_active_slot_len);
+        if (m_is_static) {
+            create_1d_input("chunk_valid_len", m_compute_params.input_len, true);
+        }
     }
     for (const auto & [node_name, writeback] : m_compute_params.rs_writebacks) {
         create_1d_input("rs_slot_begin_" + node_name, writeback.slot_begin);
@@ -1173,9 +1225,13 @@ void GgmlOvDecoder::compute_model_inputs() {
             if (src == nullptr) {
                 continue;
             }
-            std::string src_name = std::string(src->name);
-            if (src->flags & GGML_TENSOR_FLAG_INPUT) {
-                src_name = get_graph_input_ov_name(src, node);
+            ggml_tensor * model_input = src;
+            if (node->op == GGML_OP_FLASH_ATTN_EXT && is_flat_kv_view(src)) {
+                model_input = src->view_src;
+            }
+            std::string src_name = std::string(model_input->name);
+            if (model_input->flags & GGML_TENSOR_FLAG_INPUT) {
+                src_name = get_graph_input_ov_name(model_input, node);
             }
             if (m_model_weights.find(src_name) != m_model_weights.end() ||
                 m_weight_names.find(src_name) != m_weight_names.end()) {
@@ -1195,9 +1251,9 @@ void GgmlOvDecoder::compute_model_inputs() {
             if (m_model_inputs.find(src_name) != m_model_inputs.end()) {
                 continue;
             }
-            m_inputs[src_name] = src;
+            m_inputs[src_name] = model_input;
 
-            ggml_backend_buffer * buffer = src->buffer;
+            ggml_backend_buffer * buffer = model_input->buffer;
             // GGML_BACKEND_BUFFER_USAGE_ANY are kv caches
             if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY) {
                 if (auto it = std::find(m_model_params.kv_names.begin(), m_model_params.kv_names.end(), src_name);
@@ -1205,8 +1261,8 @@ void GgmlOvDecoder::compute_model_inputs() {
                     m_model_params.kv_names.push_back(src_name);
                 }
             }
-            ov::PartialShape param_shape = get_graph_input_shape(node, src);
-            auto param_node = std::make_shared<ov::op::v0::Parameter>(get_ov_type(src), param_shape);
+            ov::PartialShape param_shape = get_graph_input_shape(node, model_input);
+            auto param_node = std::make_shared<ov::op::v0::Parameter>(get_ov_type(model_input), param_shape);
             param_node->set_friendly_name(src_name);
             param_node->output(0).get_tensor().set_names({src_name});
             m_model_inputs[src_name] = param_node;
@@ -1529,17 +1585,34 @@ void GgmlOvDecoder::compute_node_dynamic_dims() {
             }
             break;
         }
-        case GGML_OP_TRANSPOSE:
+        case GGML_OP_TRANSPOSE: {
+            m_node_dynamic_dims[node] = -1;
+            if (m_node_dynamic_dims[node->src[0]] != -1) {
+                // GGML_OP_TRANSPOSE swaps ggml dimensions 0 and 1. Propagate the runtime axis by
+                // that permutation instead of matching captured extents/strides: an empty token
+                // dimension makes adjacent strides equal, and its captured extent (0) need not
+                // match the non-empty shape used to build the reusable OpenVINO model.
+                const int dynamic_dim_idx = m_node_dynamic_dims[node->src[0]];
+                m_node_dynamic_dims[node] = dynamic_dim_idx == 0 ? 1 : dynamic_dim_idx == 1 ? 0 : dynamic_dim_idx;
+            }
+            break;
+        }
         case GGML_OP_RESHAPE: {
             m_node_dynamic_dims[node] = -1;
             if (m_node_dynamic_dims[node->src[0]] != -1) {
-                auto dynamic_dim_idx = m_node_dynamic_dims[node->src[0]];
+                const auto dynamic_dim_idx = m_node_dynamic_dims[node->src[0]];
                 auto dynamic_dim_stride = node->src[0]->nb[dynamic_dim_idx];
+                int matched_dim_count = 0;
                 for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                    if (node->nb[i] == dynamic_dim_stride && node->ne[i] == node->src[0]->ne[dynamic_dim_idx]) {
+                    if (node->nb[i] == dynamic_dim_stride &&
+                        (node->ne[i] == node->src[0]->ne[dynamic_dim_idx] ||
+                         node->ne[i] == 0 || node->src[0]->ne[dynamic_dim_idx] == 0)) {
                         m_node_dynamic_dims[node] = i;
-                        break;
+                        matched_dim_count++;
                     }
+                }
+                if (matched_dim_count != 1) {
+                    m_node_dynamic_dims[node] = -1;
                 }
             }
             break;
@@ -1638,6 +1711,8 @@ void GgmlOvDecoder::compute_node_dynamic_dims() {
         case GGML_OP_DIAG:
         case GGML_OP_TRI:
         case GGML_OP_REPEAT:
+        case GGML_OP_POOL_2D:
+        case GGML_OP_ROLL:
             m_node_dynamic_dims[node] = m_node_dynamic_dims[node->src[0]];
             break;
         case GGML_OP_MUL_MAT_ID:
@@ -1645,8 +1720,14 @@ void GgmlOvDecoder::compute_node_dynamic_dims() {
             m_node_dynamic_dims[node] = m_node_dynamic_dims[node->src[1]];
             break;
         case GGML_OP_CPY:
-        case GGML_OP_SET_ROWS:
             m_node_dynamic_dims[node] = -1;
+            break;
+        case GGML_OP_SET_ROWS:
+            // KV SET_ROWS returns the full cache. Its sequence extent is runtime-dependent in the
+            // reusable dynamic model and becomes append-grown after LlamaCppToStateful. Preserve
+            // ggml dim 1 through the following cache VIEW/RESHAPE instead of baking ctx_per_seq.
+            m_node_dynamic_dims[node] =
+                node->src[2] != nullptr && is_kvcache(node->src[2], nullptr) ? 1 : -1;
             break;
         default:
             // Explicitly mark unhandled ops static instead of leaving the node absent from the map.
@@ -2095,6 +2176,22 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
         }
         return static_cast<int64_t>(-1);
     }
+    if ((name == "flat_kv_shape_k" || name == "flat_kv_shape_v") && info.node->op == GGML_OP_FLASH_ATTN_EXT) {
+        const int index = name == "flat_kv_shape_k" ? 1 : 2;
+        const ggml_tensor * view = info.node->src[index];
+        if (!is_flat_kv_view(view)) {
+            return std::vector<int64_t>{};
+        }
+        return std::vector<int64_t>{view->ne[3], view->ne[2], view->ne[1], view->ne[0]};
+    }
+    if ((name == "flat_kv_offset_k" || name == "flat_kv_offset_v") && info.node->op == GGML_OP_FLASH_ATTN_EXT) {
+        const int index = name == "flat_kv_offset_k" ? 1 : 2;
+        const ggml_tensor * view = info.node->src[index];
+        if (!is_flat_kv_view(view)) {
+            return static_cast<int64_t>(0);
+        }
+        return static_cast<int64_t>(view->view_offs / view->nb[0]);
+    }
     if (name == "rs_writeback_name") {
         return recurrent_writeback_name(m_cgraph, info.node);
     }
@@ -2132,8 +2229,30 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
         return ggml_get_op_params_f32(info.node, 2);
     }
     if (name == "glu_limit") {
-        // GGML_GLU_OP_SWIGLU_OAI (gpt-oss): limit at op_params[3].
+        // GGML_GLU_OP_SWIGLU_OAI and GGML_GLU_OP_SWIGLU_CLAMP: limit at op_params[3].
         return ggml_get_op_params_f32(info.node, 3);
+    }
+    if (name == "pool_params") {
+        return std::vector<int32_t>{ggml_get_op_params_i32(info.node, 1),
+                                    ggml_get_op_params_i32(info.node, 2),
+                                    ggml_get_op_params_i32(info.node, 3),
+                                    ggml_get_op_params_i32(info.node, 4),
+                                    ggml_get_op_params_i32(info.node, 5),
+                                    ggml_get_op_params_i32(info.node, 6)};
+    }
+    if (name == "roll_shifts") {
+        return std::vector<int64_t>{ggml_get_op_params_i32(info.node, 3),
+                                    ggml_get_op_params_i32(info.node, 2),
+                                    ggml_get_op_params_i32(info.node, 1),
+                                    ggml_get_op_params_i32(info.node, 0)};
+    }
+    if (name == "solve_tri_params") {
+        return std::vector<int32_t>{1, 1, 0};
+    }
+    if (name == "dynamic_cache") {
+        // Cache relayouts must retain the runtime sequence dimension for the reusable CPU/GPU
+        // model. NPU's forced-static prefill/decode models intentionally keep their fixed extent.
+        return !m_is_static;
     }
     if (name == "view_interleaved") {
         // GGML_OP_VIEW op_case 5 (qwen3.5 interleaved Q/gate split): return
@@ -2384,7 +2503,20 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
             }
         }
         if (drop == -1) {
-            return std::vector<int64_t>{};  // pure-shrink: no reshape needed
+            // A generic zero-offset VIEW may only repack dimensions (Falcon Kcur:
+            // [128,2,T,1] -> [256,T,1,1]). If it carries the runtime token/cache axis, provide an
+            // explicit dynamic target instead of letting translate_view bake the capture-time T
+            // into a static Reshape. This is also required when the captured extent itself is 0.
+            const int dynamic_dim = dynamic_dim_of(node);
+            if (dynamic_dim == -1 || node->ne[dynamic_dim] == 1) {
+                return std::vector<int64_t>{};  // pure-shrink/static view: no reshape needed
+            }
+            std::vector<int64_t> tgt(GGML_MAX_DIMS);
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                tgt[i] = static_cast<int64_t>(node->ne[GGML_MAX_DIMS - 1 - i]);
+            }
+            tgt[GGML_MAX_DIMS - 1 - dynamic_dim] = -1;
+            return tgt;
         }
         // Return the static output layout (OV order). translate_view places the single -1 on the
         // token axis itself, using the sliced result's dynamic axis (element-count conservation).
@@ -2405,7 +2537,7 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
             tgt[i] = static_cast<int64_t>(node->ne[GGML_MAX_DIMS - 1 - i]);
         }
         const int d = dynamic_dim_of(node);
-        if (d != -1 && node->ne[d] > 1) {
+        if (d != -1 && node->ne[d] != 1) {
             tgt[GGML_MAX_DIMS - 1 - d] = -1;
         }
         return tgt;
@@ -2469,7 +2601,7 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
             tgt[i] = static_cast<int64_t>(node->ne[GGML_MAX_DIMS - 1 - i]);
         }
         const int d = dynamic_dim_of(node);
-        if (d != -1 && node->ne[d] > 1) {
+        if (d != -1 && node->ne[d] != 1) {
             tgt[GGML_MAX_DIMS - 1 - d] = -1;
         }
         return tgt;

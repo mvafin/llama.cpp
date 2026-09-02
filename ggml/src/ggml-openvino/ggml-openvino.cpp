@@ -31,6 +31,7 @@
 #    endif
 #    include <windows.h>
 #else
+#    include <sys/mman.h>
 #    include <unistd.h>
 #endif
 
@@ -133,6 +134,67 @@ struct ggml_backend_openvino_buffer_type_context {
     int device;
     std::string name;
 };
+
+namespace {
+struct ov_weight_buffer_registry {
+    std::mutex mutex;
+    std::vector<std::pair<void *, size_t>> buffers;
+    bool released = false;
+};
+
+ov_weight_buffer_registry & ov_weight_registry() {
+    static ov_weight_buffer_registry registry;
+    return registry;
+}
+}  // namespace
+
+void ggml_openvino_register_weight_buffer(void * data, size_t size) {
+    if (data == nullptr || size == 0) {
+        return;
+    }
+    auto & registry = ov_weight_registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    for (const auto & buffer : registry.buffers) {
+        if (buffer.first == data) {
+            return;
+        }
+    }
+    registry.buffers.emplace_back(data, size);
+}
+
+bool ggml_openvino_weight_buffers_released() {
+    auto & registry = ov_weight_registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    return registry.released;
+}
+
+void ggml_openvino_release_weight_buffers() {
+    auto & registry = ov_weight_registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    if (registry.released) {
+        return;
+    }
+
+    size_t total = 0;
+#if !defined(_WIN32)
+    const long page = sysconf(_SC_PAGESIZE);
+    for (const auto & buffer : registry.buffers) {
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(buffer.first);
+        const uintptr_t end = begin + buffer.second;
+        const uintptr_t aligned_begin = (begin + page - 1) & ~(static_cast<uintptr_t>(page) - 1);
+        const uintptr_t aligned_end = end & ~(static_cast<uintptr_t>(page) - 1);
+        if (aligned_end > aligned_begin &&
+            madvise(reinterpret_cast<void *>(aligned_begin), aligned_end - aligned_begin, MADV_DONTNEED) == 0) {
+            total += aligned_end - aligned_begin;
+        }
+    }
+#endif
+    registry.released = true;
+    GGML_LOG_INFO("%s: released %zu MB of host weight buffers (%zu buffers)\n",
+                  __func__,
+                  total / 1024 / 1024,
+                  registry.buffers.size());
+}
 
 // Buffer interface functions
 static void ggml_backend_openvino_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -244,11 +306,17 @@ static void ggml_backend_openvino_buffer_set_tensor(ggml_backend_buffer_t buffer
     bool is_2d = (tensor->ne[2] == 1 && tensor->ne[3] == 1);
 
     if (is_weight_buffer && is_full_tensor_set && is_2d) {
+        if (ggml_openvino_weight_buffers_released()) {
+            GGML_ABORT("ggml-openvino: cannot load weights after host weight buffers were released");
+        }
         // Weights-as-nodes: keep the original GGUF block bytes in tensor->data. The OpenVINO
         // gguf frontend extracts / dequantizes / requantizes from these raw bytes (the
         // decoder surfaces them as GGML_OP_NONE leaf nodes), so the backend must NOT pre-extract
         // and overwrite tensor->data here (that was the old get_model_weights() path).
         memcpy((char *) tensor->data + offset, data, size);
+        if (!ctx->is_remote) {
+            ggml_openvino_register_weight_buffer(ctx->data, ctx->size);
+        }
     } else {
         // Non-weight tensor (KV cache, activations, etc.) - copy data. test-backend-ops also goes here
         if (ctx->is_remote) {
@@ -724,6 +792,7 @@ static void ggml_backend_openvino_device_get_props(ggml_backend_dev_t dev, ggml_
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ false,
+        /* .mmap_support          = */ true,
     };
 }
 
@@ -765,11 +834,25 @@ static bool has_non_contiguous_view_input(const ggml_tensor * op) {
 }
 
 static bool is_supported_flash_attn_pattern(const ggml_tensor * op) {
-    // pattern of q,k,v should be q->op==PERMUTE, q->src[0]->op==VIEW, q->src[0]->src[0]->view_src==nullptr
+    // Decoder attention uses PERMUTE(VIEW), while Whisper also uses PERMUTE(RESHAPE) for Q and
+    // direct VIEWs of flat K/V cache allocations.
     for (int i = 0; i < 3; i++) {
         const ggml_tensor * src = op->src[i];
-        if (src->op != GGML_OP_PERMUTE || src->src[0] == nullptr || src->src[0]->op != GGML_OP_VIEW ||
-            src->src[0]->src[0] == nullptr || src->src[0]->src[0]->view_src != nullptr) {
+        if (src == nullptr) {
+            return false;
+        }
+        if (src->op == GGML_OP_PERMUTE) {
+            if (src->src[0] == nullptr ||
+                (src->src[0]->op != GGML_OP_VIEW && src->src[0]->op != GGML_OP_RESHAPE) ||
+                src->src[0]->src[0] == nullptr || src->src[0]->src[0]->view_src != nullptr) {
+                return false;
+            }
+        } else if (src->op == GGML_OP_VIEW) {
+            if (src->view_src == nullptr || src->view_src->ne[1] != 1 || src->view_src->ne[2] != 1 ||
+                src->view_src->ne[3] != 1) {
+                return false;
+            }
+        } else {
             return false;
         }
     }
@@ -885,6 +968,22 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
     }
     case GGML_OP_SUM_ROWS:
         return op->src[0]->op == GGML_OP_PERMUTE;
+    case GGML_OP_POOL_2D: {
+        const auto mode = static_cast<ggml_op_pool>(ggml_get_op_params_i32(op, 0));
+        if (mode != GGML_OP_POOL_MAX && mode != GGML_OP_POOL_AVG) {
+            return true;
+        }
+        if (ggml_openvino_get_device_name() == "GPU") {
+            const int k0 = ggml_get_op_params_i32(op, 1);
+            const int k1 = ggml_get_op_params_i32(op, 2);
+            const int p0 = ggml_get_op_params_i32(op, 5);
+            const int p1 = ggml_get_op_params_i32(op, 6);
+            if ((p0 > 0 || p1 > 0) && (k0 < 3 || k1 < 3)) {
+                return true;
+            }
+        }
+        break;
+    }
     case GGML_OP_FLASH_ATTN_EXT: {
         if (op->src[4] != nullptr) {
             // GGML_LOG_WARN("OpenVINO backend does not support FLASH_ATTN_EXT with sinks\n");
@@ -1029,7 +1128,7 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
     return false;
 }
 
-static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+static bool ggml_backend_openvino_device_supports_op_bool(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(dev->reg != nullptr);
 
     static std::set<ggml_type> supported_types{GGML_TYPE_F32,  GGML_TYPE_F16,  GGML_TYPE_BF16, GGML_TYPE_I64,
@@ -1065,7 +1164,8 @@ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, con
                                                  GGML_OP_REPEAT, GGML_OP_MUL_MAT_ID, GGML_OP_SSM_CONV,
                                                  GGML_OP_IM2COL, GGML_OP_GATED_DELTA_NET, GGML_OP_DIV,
                                                  GGML_OP_SUB, GGML_OP_CUMSUM, GGML_OP_SQR, GGML_OP_SQRT,
-                                                 GGML_OP_DIAG, GGML_OP_TRI, GGML_OP_FILL, GGML_OP_SET};
+                                                 GGML_OP_DIAG, GGML_OP_TRI, GGML_OP_FILL, GGML_OP_SET,
+                                                 GGML_OP_POOL_2D, GGML_OP_ROLL, GGML_OP_SOLVE_TRI};
     static const std::set<ggml_unary_op> supported_unary_ops{
         GGML_UNARY_OP_GELU,
         GGML_UNARY_OP_SILU,
@@ -1078,7 +1178,9 @@ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, con
     static const std::set<ggml_glu_op> supported_glu_ops{
         GGML_GLU_OP_SWIGLU,
         GGML_GLU_OP_SWIGLU_OAI,
+        GGML_GLU_OP_SWIGLU_CLAMP,
         GGML_GLU_OP_GEGLU,
+        GGML_GLU_OP_GEGLU_QUICK,
     };
 
     // DEBUG bisection seam: GGML_OPENVINO_DISABLE_OPS is a comma-separated list of ggml op names
@@ -1108,11 +1210,6 @@ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, con
         auto supported = supported_glu_ops.find(ggml_get_glu_op(op)) != supported_glu_ops.end();
         if (!supported) {
             // GGML_LOG_WARN("OpenVINO backend does not support GLU op %s\n", ggml_glu_op_name(ggml_get_glu_op(op)));
-            return false;
-        }
-        if (has_view_op_input(op)) {
-            // GGML_LOG_WARN("OpenVINO backend does not support unary op %s with view input\n",
-            //               ggml_glu_op_name(ggml_get_glu_op(op)));
             return false;
         }
         if (op->src[1] == nullptr && op->src[0]->ne[0] % 2 != 0) {
@@ -1156,6 +1253,75 @@ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, con
         return false;
     }
     return true;
+}
+
+namespace {
+struct ggml_openvino_op_support {
+    bool is_supported;
+    std::string reason;
+};
+}  // namespace
+
+static ggml_openvino_op_support ggml_backend_openvino_device_supports_op_impl(ggml_backend_dev_t dev,
+                                                                              const ggml_tensor * op) {
+    if (ggml_backend_openvino_device_supports_op_bool(dev, op)) {
+        return {true, {}};
+    }
+
+    if (const char * disabled = getenv("GGML_OPENVINO_DISABLE_OPS")) {
+        const char * name = ggml_op_name(op->op);
+        const std::string list = std::string(",") + disabled + ",";
+        if (name != nullptr && list.find(std::string(",") + name + ",") != std::string::npos) {
+            return {false, "disabled by GGML_OPENVINO_DISABLE_OPS"};
+        }
+    }
+    if (const char * disabled = getenv("GGML_OPENVINO_DISABLE_TYPES")) {
+        const std::string list = std::string(",") + disabled + ",";
+        auto listed = [&](ggml_type type) {
+            const char * name = ggml_type_name(type);
+            return name != nullptr && list.find(std::string(",") + name + ",") != std::string::npos;
+        };
+        if (listed(op->type)) {
+            return {false, "output type disabled by GGML_OPENVINO_DISABLE_TYPES"};
+        }
+        for (int i = 0; i < GGML_MAX_SRC && op->src[i] != nullptr; ++i) {
+            if (listed(op->src[i]->type)) {
+                return {false, "input type disabled by GGML_OPENVINO_DISABLE_TYPES"};
+            }
+        }
+    }
+
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && !is_supported_flash_attn_pattern(op)) {
+        return {false, "FLASH_ATTN_EXT unsupported attention pattern"};
+    }
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[4] != nullptr) {
+        return {false, "FLASH_ATTN_EXT with sinks is not supported"};
+    }
+    if (op->op == GGML_OP_GLU) {
+        return {false, "unsupported GLU variant or input shape"};
+    }
+    if (op->op == GGML_OP_POOL_2D) {
+        return {false, "unsupported POOL_2D variant or device geometry"};
+    }
+    if (op->op == GGML_OP_SOLVE_TRI) {
+        return {false, "SOLVE_TRI supports only the lower, left, non-unit variant"};
+    }
+    return {false, "unsupported operator type, data type, shape, or device-specific variant"};
+}
+
+static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    const auto support = ggml_backend_openvino_device_supports_op_impl(dev, op);
+    if (!support.is_supported) {
+        static const bool log_unsupported = ggml_openvino_getenv_int("GGML_OPENVINO_LOG_UNSUPPORTED_OPS") != 0;
+        if (log_unsupported) {
+            GGML_LOG_WARN("OpenVINO op unsupported: op '%s' (%s), type %s: %s\n",
+                          op->name,
+                          ggml_op_name(op->op),
+                          ggml_type_name(op->type),
+                          support.reason.c_str());
+        }
+    }
+    return support.is_supported;
 }
 
 static bool ggml_backend_openvino_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

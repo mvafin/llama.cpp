@@ -127,7 +127,11 @@ std::pair<int64_t, int64_t> detect_view_feature_window(const ggml_tensor * node)
     // [off, off+feat_len) slice -- that reinterprets the gap as feature data and scrambles the heads.
     // detect_view_interleaved_window handles those via a stride-preserving reshape instead.
     {
-        struct FeatDim { int64_t ne; size_t nb; };
+        struct FeatDim {
+            int64_t ne;
+            size_t nb;
+        };
+
         std::vector<FeatDim> feats;
         for (int i = 0; i < GGML_MAX_DIMS; ++i) {
             if (i == token_dim || node->ne[i] <= 1) {
@@ -135,8 +139,7 @@ std::pair<int64_t, int64_t> detect_view_feature_window(const ggml_tensor * node)
             }
             feats.push_back({node->ne[i], node->nb[i]});
         }
-        std::sort(feats.begin(), feats.end(),
-                  [](const FeatDim & a, const FeatDim & b) { return a.nb < b.nb; });
+        std::sort(feats.begin(), feats.end(), [](const FeatDim & a, const FeatDim & b) { return a.nb < b.nb; });
         size_t running = elem;
         for (const auto & f : feats) {
             if (f.nb != running) {
@@ -172,11 +175,11 @@ std::pair<int64_t, int64_t> detect_view_feature_window(const ggml_tensor * node)
 // simpler op_case-3 path).
 struct InterleavedWindow {
     bool valid = false;
-    int64_t token_dim = -1;      // node dim carrying T
-    int64_t group_count = 1;     // number of interleaved groups packed on ggml dim0 (== n_head here)
-    int64_t group_stride = 0;    // element stride between consecutive groups on ggml dim0
-    int64_t inner_off = 0;       // element offset of the wanted sub-block within a group
-    int64_t inner_len = 0;       // element length of the wanted sub-block within a group
+    int64_t token_dim = -1;    // node dim carrying T
+    int64_t group_count = 1;   // number of interleaved groups packed on ggml dim0 (== n_head here)
+    int64_t group_stride = 0;  // element stride between consecutive groups on ggml dim0
+    int64_t inner_off = 0;     // element offset of the wanted sub-block within a group
+    int64_t inner_len = 0;     // element length of the wanted sub-block within a group
 };
 
 InterleavedWindow detect_view_interleaved_window(const ggml_tensor * node) {
@@ -384,15 +387,15 @@ void GgmlOvDecoder::set_input_output() {
                     src_name = "rope_freqs.weight";
                 }
                 ggml_backend_buffer * buffer = src->buffer;
-                const bool is_weight = is_rope_freqs_weight(src, node) ||
-                                       (buffer && (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
-                                                   ggml_is_quantized(src->type)));
+                const bool is_weight =
+                    is_rope_freqs_weight(src, node) ||
+                    (buffer && (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS || ggml_is_quantized(src->type)));
                 if (!is_weight || seen_weights.count(src_name)) {
                     continue;
                 }
                 seen_weights.insert(src_name);
-                m_used_names.insert(src_name);              // reserve canonical weight name
-                m_tensor_unique_name[src] = src_name;       // weights keep their canonical name
+                m_used_names.insert(src_name);         // reserve canonical weight name
+                m_tensor_unique_name[src] = src_name;  // weights keep their canonical name
                 NodeInfo wi;
                 wi.node = src;
                 wi.node_name = src_name;
@@ -499,12 +502,10 @@ void GgmlOvDecoder::set_input_output() {
             const bool recurrent_cpy_source =
                 i == 0 && node->op == GGML_OP_CPY && src->op == GGML_OP_VIEW && src->src[0] != nullptr &&
                 (is_conv_state_writeback(node) || src->src[0]->op == GGML_OP_GATED_DELTA_NET);
-            const bool recurrent_cpy_destination =
-                i == 1 && node->op == GGML_OP_CPY && src->op == GGML_OP_VIEW && src->view_src != nullptr &&
-                is_kvcache(src->view_src, nullptr);
+            const bool recurrent_cpy_destination = i == 1 && node->op == GGML_OP_CPY && src->op == GGML_OP_VIEW &&
+                                                   src->view_src != nullptr && is_kvcache(src->view_src, nullptr);
             const bool recurrent_scale_source =
-                i == 0 && node->op == GGML_OP_SCALE && node->view_src != nullptr &&
-                is_kvcache(node->view_src, nullptr);
+                i == 0 && node->op == GGML_OP_SCALE && node->view_src != nullptr && is_kvcache(node->view_src, nullptr);
             if (recurrent_cpy_source) {
                 src_name = unique_tensor_name(src->src[0], std::string(src->src[0]->name));
             } else if (recurrent_cpy_destination) {
@@ -645,7 +646,10 @@ int GgmlOvDecoder::compute_op_case(const ggml_tensor * node) const {
         } else if (node->src[0]->op == GGML_OP_GET_ROWS && node->src[1] != nullptr &&
                    node->src[1]->op == GGML_OP_VIEW && node->src[1]->view_src != nullptr &&
                    is_kvcache(node->src[1]->view_src, nullptr)) {
-            op_case = 3;
+            // Empty recurrent-state compaction is a no-op. Keep it explicit because the selected
+            // row count may become dynamic in the OpenVINO graph and cannot then be detected from
+            // PartialShape alone by the CPY translator.
+            op_case = ggml_nelements(node->src[0]) == 0 ? 5 : 3;
         }
         break;
     }
@@ -657,11 +661,11 @@ int GgmlOvDecoder::compute_op_case(const ggml_tensor * node) const {
     case GGML_OP_ROPE: {
         const int mode = node->op_params[2];
         switch (mode) {
-       case GGML_ROPE_TYPE_NEOX: {
+        case GGML_ROPE_TYPE_NEOX: {
             op_case = 0x00010000;
             break;
         }
-       case GGML_ROPE_TYPE_IMROPE: {
+        case GGML_ROPE_TYPE_IMROPE: {
             op_case = 0x00020000;
             break;
         }
@@ -720,9 +724,8 @@ int GgmlOvDecoder::compute_op_case(const ggml_tensor * node) const {
                 //   * offset > 0 selecting a contiguous sub-range along that dim (qwen3-next
                 //     conv_state_last: last d_conv-1 columns of the conv window). The offset must be a
                 //     clean multiple of the sliced dim's stride. view_slice computes {axis,start,len}.
-                const bool pure_shrink =
-                    (diff_count == 1) && strides_preserved && diff_dim >= 0 && src->nb[diff_dim] > 0 &&
-                    (byte_offset % src->nb[diff_dim] == 0);
+                const bool pure_shrink = (diff_count == 1) && strides_preserved && diff_dim >= 0 &&
+                                         src->nb[diff_dim] > 0 && (byte_offset % src->nb[diff_dim] == 0);
                 bool select_and_drop = false;
                 for (int d = 0; d < GGML_MAX_DIMS && !select_and_drop; ++d) {
                     if (src->ne[d] <= 1) {
@@ -802,8 +805,8 @@ const ggml_tensor * attn_kvcache_view(const ggml_tensor * attn) {
     if (perm != nullptr && perm->op == GGML_OP_CPY) {
         perm = perm->src[0];
     }
-    if (perm == nullptr || perm->op != GGML_OP_PERMUTE || perm->src[0] == nullptr ||
-        perm->src[0]->op != GGML_OP_VIEW || perm->src[0]->src[0] == nullptr) {
+    if (perm == nullptr || perm->op != GGML_OP_PERMUTE || perm->src[0] == nullptr || perm->src[0]->op != GGML_OP_VIEW ||
+        perm->src[0]->src[0] == nullptr) {
         return nullptr;
     }
     return perm->src[0];
@@ -850,6 +853,7 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
             const ggml_tensor * mask;
             const ggml_tensor * cache_k;  // K cache this mask's attention reads; nullptr = unknown
         };
+
         std::vector<MaskInfo> masks;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             const auto * node = cgraph->nodes[i];
@@ -864,8 +868,7 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
             if (mask == nullptr) {
                 continue;
             }
-            auto it =
-                std::find_if(masks.begin(), masks.end(), [mask](const MaskInfo & m) { return m.mask == mask; });
+            auto it = std::find_if(masks.begin(), masks.end(), [mask](const MaskInfo & m) { return m.mask == mask; });
             if (it == masks.end()) {
                 masks.push_back({mask, cache_k});
             } else if (it->cache_k == nullptr) {
@@ -1049,7 +1052,7 @@ void GgmlOvDecoder::validate_cgraph() const {
 
 ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op, const ggml_tensor * input) const {
     if (m_naive) {
-        return input!= nullptr ? ov::PartialShape{get_shape(input)} : ov::PartialShape{get_shape(op)};
+        return input != nullptr ? ov::PartialShape{get_shape(input)} : ov::PartialShape{get_shape(op)};
     }
     auto name = std::string(input->name);
     ov::PartialShape input_shape;
@@ -1228,6 +1231,11 @@ void GgmlOvDecoder::compute_model_inputs() {
             ggml_tensor * model_input = src;
             if (node->op == GGML_OP_FLASH_ATTN_EXT && is_flat_kv_view(src)) {
                 model_input = src->view_src;
+            } else if (i == 1 && node->op == GGML_OP_CPY && src->op == GGML_OP_VIEW && src->view_src != nullptr &&
+                       is_kvcache(src->view_src, nullptr)) {
+                // Recurrent CPY consumers are wired to the full cache allocation in
+                // set_input_output(); expose that same allocation as the model Parameter.
+                model_input = src->view_src;
             }
             std::string src_name = std::string(model_input->name);
             if (model_input->flags & GGML_TENSOR_FLAG_INPUT) {
@@ -1350,14 +1358,14 @@ void GgmlOvDecoder::compute_model_outputs() {
         if (cur_node != nullptr) {
             // Use the same unique name the producer registered so a model output matches its node.
             auto un = m_tensor_unique_name.find(cur_node);
-            std::string node_output_name = (un != m_tensor_unique_name.end()) ? un->second : std::string(cur_node->name);
+            std::string node_output_name =
+                (un != m_tensor_unique_name.end()) ? un->second : std::string(cur_node->name);
             m_model_outputs[node_output_name] = cur_node;
             if (seen_output_names.insert(node_output_name).second) {
                 m_model_output_names.push_back(node_output_name);
             }
         }
     }
-
 }
 
 int GgmlOvDecoder::dynamic_dim_of(const ggml_tensor * tensor) const {
@@ -1605,8 +1613,8 @@ void GgmlOvDecoder::compute_node_dynamic_dims() {
                 int matched_dim_count = 0;
                 for (int i = 0; i < GGML_MAX_DIMS; i++) {
                     if (node->nb[i] == dynamic_dim_stride &&
-                        (node->ne[i] == node->src[0]->ne[dynamic_dim_idx] ||
-                         node->ne[i] == 0 || node->src[0]->ne[dynamic_dim_idx] == 0)) {
+                        (node->ne[i] == node->src[0]->ne[dynamic_dim_idx] || node->ne[i] == 0 ||
+                         node->src[0]->ne[dynamic_dim_idx] == 0)) {
                         m_node_dynamic_dims[node] = i;
                         matched_dim_count++;
                     }
@@ -1726,8 +1734,7 @@ void GgmlOvDecoder::compute_node_dynamic_dims() {
             // KV SET_ROWS returns the full cache. Its sequence extent is runtime-dependent in the
             // reusable dynamic model and becomes append-grown after LlamaCppToStateful. Preserve
             // ggml dim 1 through the following cache VIEW/RESHAPE instead of baking ctx_per_seq.
-            m_node_dynamic_dims[node] =
-                node->src[2] != nullptr && is_kvcache(node->src[2], nullptr) ? 1 : -1;
+            m_node_dynamic_dims[node] = node->src[2] != nullptr && is_kvcache(node->src[2], nullptr) ? 1 : -1;
             break;
         default:
             // Explicitly mark unhandled ops static instead of leaving the node absent from the map.
@@ -2233,18 +2240,13 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
         return ggml_get_op_params_f32(info.node, 3);
     }
     if (name == "pool_params") {
-        return std::vector<int32_t>{ggml_get_op_params_i32(info.node, 1),
-                                    ggml_get_op_params_i32(info.node, 2),
-                                    ggml_get_op_params_i32(info.node, 3),
-                                    ggml_get_op_params_i32(info.node, 4),
-                                    ggml_get_op_params_i32(info.node, 5),
-                                    ggml_get_op_params_i32(info.node, 6)};
+        return std::vector<int32_t>{ggml_get_op_params_i32(info.node, 1), ggml_get_op_params_i32(info.node, 2),
+                                    ggml_get_op_params_i32(info.node, 3), ggml_get_op_params_i32(info.node, 4),
+                                    ggml_get_op_params_i32(info.node, 5), ggml_get_op_params_i32(info.node, 6)};
     }
     if (name == "roll_shifts") {
-        return std::vector<int64_t>{ggml_get_op_params_i32(info.node, 3),
-                                    ggml_get_op_params_i32(info.node, 2),
-                                    ggml_get_op_params_i32(info.node, 1),
-                                    ggml_get_op_params_i32(info.node, 0)};
+        return std::vector<int64_t>{ggml_get_op_params_i32(info.node, 3), ggml_get_op_params_i32(info.node, 2),
+                                    ggml_get_op_params_i32(info.node, 1), ggml_get_op_params_i32(info.node, 0)};
     }
     if (name == "solve_tri_params") {
         return std::vector<int32_t>{1, 1, 0};
@@ -2397,8 +2399,7 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
             }
             // Offset must index cleanly inside this axis to be the selected one.
             const bool offset_consistent =
-                (byte_offset % src->nb[d] == 0) &&
-                (static_cast<int64_t>(byte_offset / src->nb[d]) < src->ne[d]);
+                (byte_offset % src->nb[d] == 0) && (static_cast<int64_t>(byte_offset / src->nb[d]) < src->ne[d]);
             if (!offset_consistent) {
                 continue;
             }
@@ -2615,8 +2616,7 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
     if (name == "input_ggml_shape") {
         // ggml shape of input 0, needed by the VIEW op_case 3 translator to restore the
         // original layout before slicing (the OV node may have been reshaped already).
-        return get_shape(info.node_inputs_names.empty() ? info.node
-                                                        : info.node_inputs.at(info.node_inputs_names[0]));
+        return get_shape(info.node_inputs_names.empty() ? info.node : info.node_inputs.at(info.node_inputs_names[0]));
     }
     if (name == "is_swa") {
         // FLASH_ATTN_EXT: the mask input (src[3]) identifies the layer flavor -- see
@@ -2629,8 +2629,7 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
     if (name == "view_seq_offset") {
         // PERMUTE KV-cache case: byte offset of the VIEW input divided by nb[3] (bytes per
         // sequence) gives the first active sequence index.
-        if (info.node->op == GGML_OP_PERMUTE && info.node->src[0] != nullptr &&
-            info.node->src[0]->op == GGML_OP_VIEW) {
+        if (info.node->op == GGML_OP_PERMUTE && info.node->src[0] != nullptr && info.node->src[0]->op == GGML_OP_VIEW) {
             const ggml_tensor * view = info.node->src[0];
             size_t byte_offset = 0;
             memcpy(&byte_offset, view->op_params, sizeof(size_t));

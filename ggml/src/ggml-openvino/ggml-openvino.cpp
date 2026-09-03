@@ -9,8 +9,8 @@
 #include "ggml.h"
 
 #include <atomic>
-#include <cstdlib>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -190,9 +190,7 @@ void ggml_openvino_release_weight_buffers() {
     }
 #endif
     registry.released = true;
-    GGML_LOG_INFO("%s: released %zu MB of host weight buffers (%zu buffers)\n",
-                  __func__,
-                  total / 1024 / 1024,
+    GGML_LOG_INFO("%s: released %zu MB of host weight buffers (%zu buffers)\n", __func__, total / 1024 / 1024,
                   registry.buffers.size());
 }
 
@@ -406,11 +404,9 @@ static bool ggml_backend_openvino_buffer_cpy_tensor(ggml_backend_buffer_t buffer
             ggml_backend_openvino_buffer_context * src_ctx =
                 (ggml_backend_openvino_buffer_context *) src->buffer->context;
             if (src_ctx->is_remote) {
-                cl_int err =
-                    mem_cpy_fn(queue, CL_TRUE, dst->data, src->data, ggml_nbytes(src), 0, nullptr, nullptr);
+                cl_int err = mem_cpy_fn(queue, CL_TRUE, dst->data, src->data, ggml_nbytes(src), 0, nullptr, nullptr);
                 if (err != CL_SUCCESS) {
-                    GGML_LOG_ERROR("%s: clEnqueueMemcpyINTEL (device-to-device) failed with error %d\n", __func__,
-                                   err);
+                    GGML_LOG_ERROR("%s: clEnqueueMemcpyINTEL (device-to-device) failed with error %d\n", __func__, err);
                     return false;
                 }
                 return true;
@@ -842,8 +838,7 @@ static bool is_supported_flash_attn_pattern(const ggml_tensor * op) {
             return false;
         }
         if (src->op == GGML_OP_PERMUTE) {
-            if (src->src[0] == nullptr ||
-                (src->src[0]->op != GGML_OP_VIEW && src->src[0]->op != GGML_OP_RESHAPE) ||
+            if (src->src[0] == nullptr || (src->src[0]->op != GGML_OP_VIEW && src->src[0]->op != GGML_OP_RESHAPE) ||
                 src->src[0]->src[0] == nullptr || src->src[0]->src[0]->view_src != nullptr) {
                 return false;
             }
@@ -873,10 +868,18 @@ static bool tensor_view_fits_src_buffer(const ggml_tensor * tensor) {
     return tensor_nbytes <= src_nbytes - tensor->view_offs;
 }
 
-// A CPY whose destination is a view into a (recurrent-state) cache is supported when the write is
-// either empty or contiguous and fits within the src buffer -- this admits the qwen3-next conv/GDN
-// state writeback (an in-place CPY into a USAGE_ANY cache view) that HEAD's cast-only guard rejected.
-// A plain cast-CPY (view_src == nullptr) is trivially supported here.
+// Match the convolution-state writeback recognized by GgmlOvDecoder::compute_op_case(). It may be
+// strided in ggml, but the frontend lowers it as an explicit slice/reshape update.
+static bool is_recurrent_state_cpy(const ggml_tensor * op) {
+    return op->view_src != nullptr && op->view_src->buffer != nullptr &&
+           op->view_src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY && op->src[0] != nullptr &&
+           op->src[0]->op == GGML_OP_VIEW && op->src[0]->src[0] != nullptr &&
+           (op->src[0]->src[0]->op == GGML_OP_CONCAT || op->src[0]->src[0]->op == GGML_OP_GATED_DELTA_NET) &&
+           op->src[1] != nullptr && op->src[1]->op == GGML_OP_VIEW && op->src[1]->view_src == op->view_src;
+}
+
+// A CPY whose destination is a view is supported when the write is empty, contiguous, or a
+// recognized recurrent-state update, and the view fits entirely within its source buffer.
 static bool cpy_output_view_is_supported(const ggml_tensor * op) {
     if (op->view_src == nullptr) {
         return true;
@@ -884,7 +887,7 @@ static bool cpy_output_view_is_supported(const ggml_tensor * op) {
     if (!tensor_view_fits_src_buffer(op)) {
         return false;
     }
-    return ggml_nbytes(op) == 0 || ggml_is_contiguous(op);
+    return ggml_nbytes(op) == 0 || ggml_is_contiguous(op) || is_recurrent_state_cpy(op);
 }
 
 static bool checked_mul_size(size_t a, size_t b, size_t & out) {
@@ -938,6 +941,13 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
     case GGML_OP_ADD:
     case GGML_OP_MUL:
     case GGML_OP_SUB: {
+        // Strided views are not represented by the GGUF frontend's element-wise translators.
+        // Admitting them silently treats the logical tensor as densely packed and can also make
+        // activation+MUL fusion consume padding. Keep these graphs on a backend that preserves
+        // ggml's byte strides until VIEW lowering carries the complete stride contract.
+        if (has_non_contiguous_view_input(op)) {
+            return true;
+        }
         if (op->src[1]->op == GGML_OP_PERMUTE) {
             return true;
         }
@@ -949,12 +959,11 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         break;
     }
     case GGML_OP_ADD_ID:
-        return op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
-               op->src[1]->type != GGML_TYPE_F32 || op->src[2]->type != GGML_TYPE_I32;
+        return op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32 ||
+               op->src[2]->type != GGML_TYPE_I32;
     case GGML_OP_DIV: {
         for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-            if (op->src[0]->ne[i] != op->src[1]->ne[i] && op->src[0]->ne[i] != 1 &&
-                op->src[1]->ne[i] != 1) {
+            if (op->src[0]->ne[i] != op->src[1]->ne[i] && op->src[0]->ne[i] != 1 && op->src[1]->ne[i] != 1) {
                 return true;
             }
         }
@@ -1022,7 +1031,17 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
             // GGML_LOG_WARN("OpenVINO backend does not support CPY with bf16 types\n");
             return true;
         }
-        if (ggml_nelements(op->src[0]) != ggml_nelements(op->src[1])) {
+        const bool empty_recurrent_compaction = ggml_nelements(op->src[0]) == 0 && op->src[0]->op == GGML_OP_GET_ROWS &&
+                                                op->src[1] != nullptr && op->src[1]->op == GGML_OP_VIEW &&
+                                                op->src[1]->view_src != nullptr &&
+                                                op->src[1]->view_src->buffer != nullptr &&
+                                                op->src[1]->view_src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY;
+        if (!empty_recurrent_compaction && ggml_nelements(op->src[0]) != ggml_nelements(op->src[1])) {
+            return true;
+        }
+        // CPY into a quantized tensor is quantization, not a plain element-type conversion.
+        // The current frontend lowering uses Convert and produces invalid q4_0 data.
+        if (ggml_is_quantized(op->src[1]->type)) {
             return true;
         }
         // op-test cases with non-contiguous src or dst
@@ -1044,12 +1063,15 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         const auto nb2 = static_cast<size_t>(op->op_params[1]);
         const auto nb3 = static_cast<size_t>(op->op_params[2]);
         // OpenVINO SET translation currently supports dst layouts that match src0 strides.
-        if (op->src[0] == nullptr || nb1 != op->src[0]->nb[1] || nb2 != op->src[0]->nb[2] ||
-            nb3 != op->src[0]->nb[3]) {
+        if (op->src[0] == nullptr || nb1 != op->src[0]->nb[1] || nb2 != op->src[0]->nb[2] || nb3 != op->src[0]->nb[3]) {
             return true;
         }
         break;
     }
+    case GGML_OP_SOLVE_TRI:
+        // The decomposition is validated on CPU only. Do not expose it through the llama.cpp
+        // backend on GPU until the device implementation has an accuracy regression test.
+        return ggml_openvino_get_device_name() != "CPU";
     case GGML_OP_GATED_DELTA_NET: {
         if (op->src[2] != nullptr && op->src[2]->op == GGML_OP_PERMUTE) {
             return true;
@@ -1090,6 +1112,11 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
             // supported as long as the rotated span is a valid even prefix of the head dim.
             // GGML_LOG_WARN("OpenVINO backend does not support ROPE with n_dims %d and src[0]->ne[0] %ld\n", n_dims,
             //               op->src[0]->ne[0]);
+            return true;
+        }
+        // The frontend RoPE lowering currently rotates the complete head dimension. Partial
+        // rotation would therefore produce numerically wrong results for the untouched suffix.
+        if (rope_dims != head_dim) {
             return true;
         }
         if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) {
@@ -1154,33 +1181,34 @@ static bool ggml_backend_openvino_device_supports_op_bool(ggml_backend_dev_t dev
         }
     }
 
-    static const std::set<ggml_op> supported_ops{GGML_OP_NONE, GGML_OP_ADD, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_VIEW,
-                                                 GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_TRANSPOSE,
-                                                 GGML_OP_GET_ROWS, GGML_OP_ROPE, GGML_OP_RMS_NORM, GGML_OP_SCALE,
-                                                 GGML_OP_SOFT_MAX,
-                                                 GGML_OP_SET_ROWS, GGML_OP_FLASH_ATTN_EXT, GGML_OP_CPY,
-                                                 GGML_OP_NORM, GGML_OP_L2_NORM, GGML_OP_SUM_ROWS, GGML_OP_CONCAT,
-                                                 GGML_OP_CLAMP, GGML_OP_ARGSORT, GGML_OP_ADD_ID, GGML_OP_PAD,
-                                                 GGML_OP_REPEAT, GGML_OP_MUL_MAT_ID, GGML_OP_SSM_CONV,
-                                                 GGML_OP_IM2COL, GGML_OP_GATED_DELTA_NET, GGML_OP_DIV,
-                                                 GGML_OP_SUB, GGML_OP_CUMSUM, GGML_OP_SQR, GGML_OP_SQRT,
-                                                 GGML_OP_DIAG, GGML_OP_TRI, GGML_OP_FILL, GGML_OP_SET,
-                                                 GGML_OP_POOL_2D, GGML_OP_ROLL, GGML_OP_SOLVE_TRI};
+    static const std::set<ggml_op> supported_ops{GGML_OP_NONE,       GGML_OP_ADD,
+                                                 GGML_OP_MUL,        GGML_OP_MUL_MAT,
+                                                 GGML_OP_VIEW,       GGML_OP_CONT,
+                                                 GGML_OP_RESHAPE,    GGML_OP_PERMUTE,
+                                                 GGML_OP_TRANSPOSE,  GGML_OP_GET_ROWS,
+                                                 GGML_OP_ROPE,       GGML_OP_RMS_NORM,
+                                                 GGML_OP_SCALE,      GGML_OP_SOFT_MAX,
+                                                 GGML_OP_SET_ROWS,   GGML_OP_FLASH_ATTN_EXT,
+                                                 GGML_OP_CPY,        GGML_OP_NORM,
+                                                 GGML_OP_L2_NORM,    GGML_OP_SUM_ROWS,
+                                                 GGML_OP_CONCAT,     GGML_OP_CLAMP,
+                                                 GGML_OP_ARGSORT,    GGML_OP_ADD_ID,
+                                                 GGML_OP_PAD,        GGML_OP_REPEAT,
+                                                 GGML_OP_MUL_MAT_ID, GGML_OP_SSM_CONV,
+                                                 GGML_OP_IM2COL,     GGML_OP_GATED_DELTA_NET,
+                                                 GGML_OP_DIV,        GGML_OP_SUB,
+                                                 GGML_OP_CUMSUM,     GGML_OP_SQR,
+                                                 GGML_OP_SQRT,       GGML_OP_DIAG,
+                                                 GGML_OP_TRI,        GGML_OP_FILL,
+                                                 GGML_OP_SET,        GGML_OP_POOL_2D,
+                                                 GGML_OP_ROLL,       GGML_OP_SOLVE_TRI};
     static const std::set<ggml_unary_op> supported_unary_ops{
-        GGML_UNARY_OP_GELU,
-        GGML_UNARY_OP_SILU,
-        GGML_UNARY_OP_TANH,
-        GGML_UNARY_OP_SOFTPLUS,
-        GGML_UNARY_OP_SIGMOID,
-        GGML_UNARY_OP_EXP,
-        GGML_UNARY_OP_NEG,
+        GGML_UNARY_OP_GELU,    GGML_UNARY_OP_SILU, GGML_UNARY_OP_TANH, GGML_UNARY_OP_SOFTPLUS,
+        GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_EXP,  GGML_UNARY_OP_NEG,
     };
     static const std::set<ggml_glu_op> supported_glu_ops{
-        GGML_GLU_OP_SWIGLU,
-        GGML_GLU_OP_SWIGLU_OAI,
-        GGML_GLU_OP_SWIGLU_CLAMP,
-        GGML_GLU_OP_GEGLU,
-        GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SWIGLU, GGML_GLU_OP_SWIGLU_OAI,  GGML_GLU_OP_SWIGLU_CLAMP,
+        GGML_GLU_OP_GEGLU,  GGML_GLU_OP_GEGLU_QUICK,
     };
 
     // DEBUG bisection seam: GGML_OPENVINO_DISABLE_OPS is a comma-separated list of ggml op names
@@ -1199,6 +1227,9 @@ static bool ggml_backend_openvino_device_supports_op_bool(ggml_backend_dev_t dev
     case GGML_OP_UNARY: {
         auto supported = supported_unary_ops.find(ggml_get_unary_op(op)) != supported_unary_ops.end();
         if (!supported) {
+            return false;
+        }
+        if (has_non_contiguous_view_input(op)) {
             return false;
         }
         if (ggml_get_unary_op(op) == GGML_UNARY_OP_EXP && op->type == GGML_TYPE_F32) {
@@ -1314,11 +1345,8 @@ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, con
     if (!support.is_supported) {
         static const bool log_unsupported = ggml_openvino_getenv_int("GGML_OPENVINO_LOG_UNSUPPORTED_OPS") != 0;
         if (log_unsupported) {
-            GGML_LOG_WARN("OpenVINO op unsupported: op '%s' (%s), type %s: %s\n",
-                          op->name,
-                          ggml_op_name(op->op),
-                          ggml_type_name(op->type),
-                          support.reason.c_str());
+            GGML_LOG_WARN("OpenVINO op unsupported: op '%s' (%s), type %s: %s\n", op->name, ggml_op_name(op->op),
+                          ggml_type_name(op->type), support.reason.c_str());
         }
     }
     return support.is_supported;

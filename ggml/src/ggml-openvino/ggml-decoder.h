@@ -16,6 +16,7 @@
 #include <vector>
 
 struct ModelParams {
+    ov::frontend::gguf::ModelContract model_contract{};
     int ctx = -1;
     int ctx_swa = -1;
     int ctx_per_seq = -1;
@@ -117,6 +118,10 @@ public:
     // visit_subgraph). The model-scoped decoder has m_node_idx == -1 and only answers the
     // model-level queries (get_model_inputs, get_model_output_names, ...).
     virtual ov::Any get_attribute(const std::string & name) const override;
+
+    ov::frontend::gguf::ModelContract get_model_contract() const override {
+        return m_model_params.model_contract;
+    }
 
     virtual size_t get_input_size() const override;
 

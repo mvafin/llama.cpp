@@ -443,9 +443,11 @@ static size_t ggml_backend_openvino_buffer_type_get_alloc_size(ggml_backend_buff
 static const ggml_backend_buffer_type_i ggml_backend_openvino_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_openvino_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_openvino_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ nullptr,
     /* .get_alignment    = */ ggml_backend_openvino_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_openvino_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_openvino_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ nullptr,
     /* .is_host          = */ nullptr,
 };
 
@@ -498,9 +500,11 @@ static bool ggml_backend_openvino_host_buffer_type_is_host(ggml_backend_buffer_t
 static const ggml_backend_buffer_type_i ggml_backend_openvino_host_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_openvino_host_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_openvino_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ nullptr,
     /* .get_alignment    = */ ggml_backend_openvino_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_openvino_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_openvino_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ nullptr,
     /* .is_host          = */ ggml_backend_openvino_host_buffer_type_is_host,
 };
 

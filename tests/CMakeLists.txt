@@ -167,6 +167,8 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp  LABEL "main behavior"  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
+llama_build(test-save-load-state.cpp)
+
 # llama_context state tests: KV and recurrent state save, load, copy, rollback
 set(LLAMA_CONTEXT_TEST_SRC
     test-llama-context.cpp
@@ -239,6 +241,9 @@ llama_test(
 set_tests_properties(test-generate-models PROPERTIES
     FIXTURES_SETUP generate-models
 )
+
+llama_test(test-save-load-state LABEL main ARGS --models "${MODEL_DIR}")
+set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 
 # Target model for test-speculative-rejection-sampling
 set(SPEC_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-speculative-models/target")

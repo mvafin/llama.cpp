@@ -2465,7 +2465,7 @@ struct test_get_rows : public test_case {
             ggml_set_name(in_padded, "in_padded");
             in = ggml_view_4d(ctx, in_padded, n, m, be1, be2,
                               in_padded->nb[1], in_padded->nb[2], in_padded->nb[3],
-                            offset_cols * in_padded->nb[0] + offset_rows * in_padded->nb[1]);
+                            (offset_cols / ggml_blck_size(type)) * in_padded->nb[0] + offset_rows * in_padded->nb[1]);
             ggml_set_name(in, "in_view");
         } else {
             in = ggml_new_tensor_4d(ctx, type, n, m, be1, be2);
@@ -10210,6 +10210,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+                          GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_Q6_K}) {
+        const int block_size = ggml_blck_size(type);
+        for (bool v : {false, true}) {
+            test_cases.emplace_back(new test_get_rows(type, block_size, 5, 4, 1, 1, v, true, block_size));
+        }
+    }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)

@@ -130,6 +130,7 @@ std::pair<int64_t, int64_t> detect_view_feature_window(const ggml_tensor * node)
         struct FeatDim {
             int64_t ne;
             size_t nb;
+            int dim;
         };
 
         std::vector<FeatDim> feats;
@@ -137,7 +138,7 @@ std::pair<int64_t, int64_t> detect_view_feature_window(const ggml_tensor * node)
             if (i == token_dim || node->ne[i] <= 1) {
                 continue;
             }
-            feats.push_back({node->ne[i], node->nb[i]});
+            feats.push_back({node->ne[i], node->nb[i], i});
         }
         std::sort(feats.begin(), feats.end(), [](const FeatDim & a, const FeatDim & b) { return a.nb < b.nb; });
         size_t running = elem;
@@ -145,14 +146,18 @@ std::pair<int64_t, int64_t> detect_view_feature_window(const ggml_tensor * node)
             if (f.nb != running) {
                 return {-1, -1};  // gap between feature dims -> not a dense contiguous window
             }
-            running *= static_cast<size_t>(f.ne);
+            const auto block_size = f.dim == 0 ? ggml_blck_size(src->type) : 1;
+            if (f.ne % block_size != 0) {
+                return {-1, -1};
+            }
+            running *= static_cast<size_t>(f.ne / block_size);
         }
     }
     const size_t byte_offset = view_byte_offset(node);
     if (byte_offset % elem != 0) {
         return {-1, -1};
     }
-    const int64_t off_elem = static_cast<int64_t>(byte_offset / elem);
+    const int64_t off_elem = static_cast<int64_t>(byte_offset / elem) * ggml_blck_size(src->type);
     if (off_elem < 0 || off_elem + feat_len > src->ne[0]) {
         return {-1, -1};
     }
@@ -235,7 +240,7 @@ InterleavedWindow detect_view_interleaved_window(const ggml_tensor * node) {
     if (node->nb[group_dim] % elem != 0) {
         return w;
     }
-    const int64_t group_stride = static_cast<int64_t>(node->nb[group_dim] / elem);
+    const int64_t group_stride = static_cast<int64_t>(node->nb[group_dim] / elem) * ggml_blck_size(src->type);
     const int64_t group_count = node->ne[group_dim];
     // The interleave is real only when the group stride exceeds the sub-block extent (a gap between
     // groups). A stride equal to inner_len is a *dense* window (feature-window path handles it).
@@ -246,7 +251,7 @@ InterleavedWindow detect_view_interleaved_window(const ggml_tensor * node) {
     if (byte_offset % elem != 0) {
         return w;
     }
-    const int64_t off_elem = static_cast<int64_t>(byte_offset / elem);
+    const int64_t off_elem = static_cast<int64_t>(byte_offset / elem) * ggml_blck_size(src->type);
     // off_elem selects the sub-block within the first group; it must stay inside one group.
     const int64_t inner_off = off_elem % group_stride;
     if (off_elem / group_stride != 0 || inner_off + inner_len > group_stride) {
@@ -379,8 +384,11 @@ void GgmlOvDecoder::set_input_output() {
             auto * node = m_cgraph->nodes[node_n];
             for (int i = 0; i < GGML_MAX_SRC; i++) {
                 auto * src = node->src[i];
-                if (src == nullptr || src->view_src) {
+                if (src == nullptr) {
                     continue;
+                }
+                if (src->view_src) {
+                    src = src->view_src;
                 }
                 std::string src_name(src->name);
                 if (is_rope_freqs_weight(src, node)) {
@@ -436,13 +444,14 @@ void GgmlOvDecoder::set_input_output() {
                 if (vsrc == nullptr) {
                     continue;
                 }
-                if (cgraph_nodes.count(vsrc) || m_weight_names.count(std::string(vsrc->name))) {
-                    continue;  // view_src is produced locally / is a weight -> normal handling
+                if (cgraph_nodes.count(vsrc)) {
+                    continue;
                 }
                 // Cache views consumed by stateful operations have dedicated handling. Ordinary
                 // backend inputs also use USAGE_ANY, so the buffer usage alone is not sufficient.
                 const bool dedicated_cache_view =
-                    vsrc->buffer && vsrc->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY &&
+                    !m_weight_names.count(std::string(vsrc->name)) && vsrc->buffer &&
+                    vsrc->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY &&
                     (node->op == GGML_OP_PERMUTE || node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_CPY ||
                      node->op == GGML_OP_SCALE || (node->op == GGML_OP_GET_ROWS && i == 0) ||
                      (node->op == GGML_OP_FLASH_ATTN_EXT && is_flat_kv_view(src)));
@@ -2359,6 +2368,9 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
             // contiguous sub-range (conv_state_last: last d_conv-1 columns).
             int64_t ov_axis = (GGML_MAX_DIMS - 1) - diff_dim;
             int64_t start = static_cast<int64_t>(byte_offset / src->nb[diff_dim]);
+            if (diff_dim == 0) {
+                start *= ggml_blck_size(src->type);
+            }
             const int64_t len = node->ne[diff_dim];
             return std::vector<int64_t>{ov_axis, start, len};
         }
@@ -2418,6 +2430,9 @@ ov::Any GgmlOvDecoder::get_attribute(const std::string & name) const {
         size_t byte_offset = 0;
         std::memcpy(&byte_offset, info.node->op_params, sizeof(size_t));
         return static_cast<int64_t>(byte_offset);
+    }
+    if (name == "view_block_size") {
+        return static_cast<int64_t>(ggml_blck_size(info.node->src[0]->type));
     }
     if (name == "view_input_strides") {
         std::vector<int64_t> strides(GGML_MAX_DIMS);

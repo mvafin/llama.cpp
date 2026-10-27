@@ -933,7 +933,8 @@ static bool mul_mat_id_requires_large_tmp(const ggml_tensor * op) {
 static bool is_op_unsupported_case(const ggml_tensor * op) {
     switch (op->op) {
     case GGML_OP_CONCAT:
-        return op->type == GGML_TYPE_I64;
+        // Packed quantized outputs require a requantization path.
+        return op->type == GGML_TYPE_I64 || ggml_is_quantized(op->type);
     case GGML_OP_VIEW: {
         if (strcmp(op->name, "selected_experts") == 0) {
             return true;
@@ -950,6 +951,11 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
     case GGML_OP_ADD:
     case GGML_OP_MUL:
     case GGML_OP_SUB: {
+        // CPU BF16 output conversion does not consistently match ggml rounding.
+        if ((op->op == GGML_OP_SUB || op->op == GGML_OP_MUL) && ggml_openvino_get_device_name() == "CPU" &&
+            op->type == GGML_TYPE_BF16 && op->src[0]->type == GGML_TYPE_BF16 && op->src[1]->type == GGML_TYPE_F32) {
+            return true;
+        }
         // Strided views are not represented by the GGUF frontend's element-wise translators.
         // Admitting them silently treats the logical tensor as densely packed and can also make
         // activation+MUL fusion consume padding. Keep these graphs on a backend that preserves
@@ -1102,6 +1108,11 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         if (op->src[0]->op == GGML_OP_VIEW && op->src[1]->op == GGML_OP_VIEW) {
             return true;
         }
+        // VIEW does not represent batch padding that splits a physical row.
+        if (op->src[0]->op == GGML_OP_VIEW && op->src[0]->nb[1] != 0 &&
+            op->src[0]->nb[2] % op->src[0]->nb[1] != 0) {
+            return true;
+        }
         break;
     }
     case GGML_OP_MUL_MAT_ID:
@@ -1241,7 +1252,9 @@ static bool ggml_backend_openvino_device_supports_op_bool(ggml_backend_dev_t dev
         if (has_non_contiguous_view_input(op)) {
             return false;
         }
-        if (ggml_get_unary_op(op) == GGML_UNARY_OP_EXP && op->type == GGML_TYPE_F32) {
+        // The runtime EXP kernel overflows below the ggml f32/bf16 limit.
+        if (ggml_get_unary_op(op) == GGML_UNARY_OP_EXP &&
+            (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_BF16)) {
             return false;
         }
         break;

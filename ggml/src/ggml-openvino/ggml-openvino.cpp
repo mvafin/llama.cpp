@@ -212,6 +212,11 @@ static bool is_stateful_enabled() {
 
 static enum ggml_status ggml_backend_openvino_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     // GGML_LOG_DEBUG("%s: buffer usage=%d, tensor name=%s\n", __func__, buffer->usage, tensor->name);
+    if (strncmp(tensor->name, "cache_", 6) == 0 && ggml_is_quantized(tensor->type)) {
+        GGML_LOG_ERROR("%s: quantized KV cache type %s is unsupported\n", __func__, ggml_type_name(tensor->type));
+        return GGML_STATUS_FAILED;
+    }
+
     ggml_backend_openvino_buffer_context * ctx = (ggml_backend_openvino_buffer_context *) buffer->context;
 
     // Put kvcache on device memory for GPU (NPU memory is too small even for kvcache)

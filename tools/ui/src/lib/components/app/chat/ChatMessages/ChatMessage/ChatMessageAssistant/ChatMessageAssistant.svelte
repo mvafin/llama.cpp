@@ -82,8 +82,11 @@
 	let lastUserMessageHeight = $state(0);
 	let assistantMarginTop = $state(0);
 
+	// The measured CSS vars feed the :last-child min-height rule only, so only
+	// the last assistant message needs them. Reading isLastAssistantMessage
+	// here also re-runs the effect when this message stops being the last.
 	$effect(() => {
-		if (!assistantEl) return;
+		if (!assistantEl || !isLastAssistantMessage) return;
 
 		assistantMarginTop = Math.round(parseFloat(getComputedStyle(assistantEl).marginTop));
 
@@ -93,17 +96,37 @@
 			'.chat-message-user'
 		) as HTMLElement | null;
 
-		if (!userMessageEl) {
+		if (!previousChatMessage || !userMessageEl) {
 			lastUserMessageHeight = 0;
 
 			return;
 		}
 
+		// a first exchange opened only by synthetic rows (e.g. the working
+		// directory notice) must fit the screen as well, so they count as part
+		// of the user turn; real earlier messages still scroll away above it
+		const leadingRows: Element[] = [];
+
+		for (
+			let row = previousChatMessage.previousElementSibling;
+			row;
+			row = row.previousElementSibling
+		) {
+			leadingRows.unshift(row);
+		}
+
+		const leadingRowsAreSynthetic =
+			leadingRows.length > 0 &&
+			leadingRows.every((row) => row.classList.contains('chat-message--synthetic'));
 		const updateHeight = () => {
 			const rect = userMessageEl.getBoundingClientRect();
 			const marginTop = Math.round(parseFloat(getComputedStyle(userMessageEl).marginTop));
+			const leadingHeight = leadingRowsAreSynthetic
+				? previousChatMessage.getBoundingClientRect().top -
+					leadingRows[0].getBoundingClientRect().top
+				: 0;
 
-			lastUserMessageHeight = Math.round(rect.height + marginTop);
+			lastUserMessageHeight = Math.round(rect.height + marginTop + leadingHeight);
 		};
 
 		updateHeight();
@@ -111,6 +134,10 @@
 		const resizeObserver = new ResizeObserver(updateHeight);
 
 		resizeObserver.observe(userMessageEl);
+
+		if (leadingRowsAreSynthetic) {
+			for (const row of leadingRows) resizeObserver.observe(row);
+		}
 
 		return () => {
 			resizeObserver.disconnect();

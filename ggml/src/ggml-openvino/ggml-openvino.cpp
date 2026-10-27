@@ -976,6 +976,8 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
     case GGML_OP_ADD_ID:
         return op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32 ||
                op->src[2]->type != GGML_TYPE_I32;
+    case GGML_OP_SCALE:
+        return !ggml_is_contiguous(op->src[0]);
     case GGML_OP_DIV: {
         for (int i = 0; i < GGML_MAX_DIMS; ++i) {
             if (op->src[0]->ne[i] != op->src[1]->ne[i] && op->src[0]->ne[i] != 1 && op->src[1]->ne[i] != 1) {
